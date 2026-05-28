@@ -31,6 +31,82 @@ type BatchStatus = {
   tasks: BatchTaskStatus[];
 };
 
+type BatchVisualState = {
+  label: string;
+  chipClassName: string;
+  progressClassName: string;
+};
+
+function playCompletionSound(): void {
+  if (typeof window === "undefined") return;
+  const audioContextClass = window.AudioContext ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!audioContextClass) return;
+
+  const context = new audioContextClass();
+  const sequence: Array<{ frequency: number; duration: number }> = [
+    { frequency: 880, duration: 0.09 },
+    { frequency: 1175, duration: 0.11 },
+    { frequency: 1568, duration: 0.16 }
+  ];
+
+  let offset = 0;
+  for (const tone of sequence) {
+    const oscillator = context.createOscillator();
+    const gainNode = context.createGain();
+    oscillator.type = "sine";
+    oscillator.frequency.value = tone.frequency;
+    gainNode.gain.setValueAtTime(0.0001, context.currentTime + offset);
+    gainNode.gain.exponentialRampToValueAtTime(0.16, context.currentTime + offset + 0.02);
+    gainNode.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + offset + tone.duration);
+    oscillator.connect(gainNode);
+    gainNode.connect(context.destination);
+    oscillator.start(context.currentTime + offset);
+    oscillator.stop(context.currentTime + offset + tone.duration + 0.02);
+    offset += tone.duration + 0.03;
+  }
+
+  setTimeout(() => {
+    void context.close();
+  }, 700);
+}
+
+function getBatchVisualState(status: string): BatchVisualState {
+  const normalized = status.toLowerCase();
+  if (normalized === "completed") {
+    return {
+      label: "Completado",
+      chipClassName: "bg-emerald-100 text-emerald-800 border border-emerald-200",
+      progressClassName: "bg-emerald-600"
+    };
+  }
+  if (normalized === "completed_with_errors") {
+    return {
+      label: "Completado con observaciones",
+      chipClassName: "bg-amber-100 text-amber-800 border border-amber-200",
+      progressClassName: "bg-amber-500"
+    };
+  }
+  if (normalized === "failed") {
+    return {
+      label: "Fallido",
+      chipClassName: "bg-rose-100 text-rose-800 border border-rose-200",
+      progressClassName: "bg-rose-600"
+    };
+  }
+  if (normalized === "processing") {
+    return {
+      label: "Procesando",
+      chipClassName: "bg-sky-100 text-sky-800 border border-sky-200",
+      progressClassName: "bg-sky-600"
+    };
+  }
+  return {
+    label: "En cola",
+    chipClassName: "bg-slate-100 text-slate-700 border border-slate-200",
+    progressClassName: "bg-slate-500"
+  };
+}
+
 export default function DashboardPage() {
   const router = useRouter();
   const [accessToken, setAccessToken] = useState<string>("");
@@ -41,6 +117,7 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState<boolean>(true);
   const [currentBatchId, setCurrentBatchId] = useState<string>("");
   const [batchStatus, setBatchStatus] = useState<BatchStatus | null>(null);
+  const [autoReloading, setAutoReloading] = useState<boolean>(false);
 
   const [search, setSearch] = useState<string>("");
   const [filter, setFilter] = useState<ProductFilter>("all");
@@ -148,35 +225,103 @@ export default function DashboardPage() {
     };
   }, [products, sources]);
 
+  const batchProgress = useMemo(() => {
+    if (!batchStatus) {
+      return {
+        completedUnits: 0,
+        percent: 0
+      };
+    }
+    const completedUnits = Math.min(batchStatus.total_files, batchStatus.processed_files + batchStatus.failed_files);
+    const percent = batchStatus.total_files > 0 ? Math.round((completedUnits / batchStatus.total_files) * 100) : 0;
+    return {
+      completedUnits,
+      percent
+    };
+  }, [batchStatus]);
+
+  const batchVisual = useMemo(() => {
+    if (!batchStatus) {
+      return getBatchVisualState("queued");
+    }
+    return getBatchVisualState(batchStatus.status);
+  }, [batchStatus]);
+
+  const sourceNameById = useMemo(() => {
+    return new Map<number, string>(sources.map((source) => [source.id, source.filename]));
+  }, [sources]);
+
+  const failedBatchTasks = useMemo(() => {
+    if (!batchStatus) return [];
+    return batchStatus.tasks.filter((task) => task.status === "failed");
+  }, [batchStatus]);
+
+  const shouldShowFailureAlert = useMemo(() => {
+    if (!batchStatus) return false;
+    return batchStatus.failed_files > 0 || failedBatchTasks.length > 0 || batchStatus.status === "failed";
+  }, [batchStatus, failedBatchTasks.length]);
+
   useEffect(() => {
     if (!currentBatchId || !accessToken) return;
     let stopped = false;
+    let timeoutRef: ReturnType<typeof setTimeout> | null = null;
+
+    const scheduleNextPoll = (delayMs: number): void => {
+      if (stopped) return;
+      timeoutRef = setTimeout(() => {
+        void poll();
+      }, delayMs);
+    };
 
     const poll = async (): Promise<void> => {
-      const response = await fetch(apiUrl(`/api/batches/${currentBatchId}`), {
-        headers: authHeader(accessToken)
-      });
-      if (!response.ok) return;
-      const data = (await response.json()) as BatchStatus;
-      if (stopped) return;
-      setBatchStatus(data);
+      try {
+        const response = await fetch(apiUrl(`/api/batches/${currentBatchId}`), {
+          headers: authHeader(accessToken)
+        });
+        if (response.status === 401) {
+          forceLogout();
+          return;
+        }
+        if (!response.ok) {
+          scheduleNextPoll(2500);
+          return;
+        }
+
+        const data = (await response.json()) as BatchStatus;
+        if (stopped) return;
+        setBatchStatus(data);
 
       const doneStatuses = new Set(["completed", "failed", "completed_with_errors"]);
       if (doneStatuses.has(data.status)) {
         await loadData(accessToken);
-        return;
+        const completedStatuses = new Set(["completed"]);
+        if (completedStatuses.has(data.status) && !stopped) {
+          setAutoReloading(true);
+          playCompletionSound();
+            setTimeout(() => {
+              if (!stopped) {
+                window.location.reload();
+              }
+            }, 1200);
+          }
+          return;
+        }
+
+        scheduleNextPoll(2000);
+      } catch {
+        scheduleNextPoll(3000);
       }
-      setTimeout(() => {
-        void poll();
-      }, 2000);
     };
 
     void poll();
 
     return () => {
       stopped = true;
+      if (timeoutRef) {
+        clearTimeout(timeoutRef);
+      }
     };
-  }, [accessToken, currentBatchId, loadData]);
+  }, [accessToken, currentBatchId, forceLogout, loadData]);
 
   if (loading) {
     return <main className="mx-auto max-w-3xl p-8">Cargando dashboard...</main>;
@@ -239,6 +384,8 @@ export default function DashboardPage() {
       <Uploader
         onUploaded={async (batchId?: string) => {
           if (batchId) {
+            setAutoReloading(false);
+            setBatchStatus(null);
             setCurrentBatchId(batchId);
           }
           await loadData(accessToken);
@@ -247,14 +394,72 @@ export default function DashboardPage() {
       />
 
       {batchStatus ? (
-        <section className="rounded-3xl border border-[var(--ap-line)] bg-white p-6 shadow-sm">
-          <h2 className="text-xl font-semibold text-[var(--ap-green-900)]">Estado de procesamiento</h2>
-          <p className="mt-2 text-sm text-slate-600">
-            Lote: <strong>{batchStatus.batch_id}</strong> · Estado: <strong>{batchStatus.status}</strong>
-          </p>
-          <p className="mt-1 text-sm text-slate-600">
-            Procesadas: {batchStatus.processed_files}/{batchStatus.total_files} · Fallidas: {batchStatus.failed_files}
-          </p>
+        <section className="mt-3 rounded-3xl border border-[var(--ap-line)] bg-gradient-to-r from-white via-[var(--ap-sand-50)] to-white p-6 shadow-sm">
+          <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+            <div>
+              <h2 className="text-xl font-semibold text-[var(--ap-green-900)]">Estado de procesamiento</h2>
+              <p className="mt-1 text-sm text-slate-600">Lote activo: {batchStatus.batch_id}</p>
+            </div>
+            <span
+              className={`inline-flex w-fit items-center rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-wide ${batchVisual.chipClassName}`}
+            >
+              {batchVisual.label}
+            </span>
+          </div>
+
+          <div className="mt-4 rounded-2xl border border-[var(--ap-line)] bg-white/80 p-4">
+            <div className="mb-2 flex items-center justify-between text-sm text-slate-700">
+              <span>
+                Avance: {batchProgress.completedUnits}/{batchStatus.total_files}
+              </span>
+                <span className="font-semibold">{batchProgress.percent}%</span>
+              </div>
+              <div className="h-2 w-full overflow-hidden rounded-full bg-slate-200">
+                <div
+                className={`h-full rounded-full transition-all duration-700 ${batchVisual.progressClassName}`}
+                style={{ width: `${batchProgress.percent}%` }}
+              />
+            </div>
+
+            <div className="mt-3 grid gap-2 text-sm text-slate-700 sm:grid-cols-3">
+              <div className="rounded-xl bg-slate-100 px-3 py-2">
+                Correctas: <strong>{batchStatus.processed_files}</strong>
+              </div>
+              <div className="rounded-xl bg-slate-100 px-3 py-2">
+                Fallidas: <strong>{batchStatus.failed_files}</strong>
+              </div>
+              <div className="rounded-xl bg-slate-100 px-3 py-2">
+                Total: <strong>{batchStatus.total_files}</strong>
+              </div>
+            </div>
+
+            {autoReloading ? (
+              <p className="mt-3 text-sm font-medium text-[var(--ap-green-800)]">
+                Procesamiento completado. Actualizando panel automáticamente...
+              </p>
+            ) : null}
+
+            {shouldShowFailureAlert ? (
+              <div className="mt-4 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+                <p className="font-semibold">
+                  Atención: hay {batchStatus.failed_files} factura(s) que no se procesaron correctamente.
+                </p>
+                <p className="mt-1">
+                  Revisa el detalle abajo. Si vuelve a fallar, envíame esos nombres y te ajusto la regla puntual.
+                </p>
+                {failedBatchTasks.length > 0 ? (
+                  <ul className="mt-2 list-disc space-y-1 pl-5">
+                    {failedBatchTasks.map((task) => (
+                      <li key={task.task_id}>
+                        <strong>{sourceNameById.get(task.source_file_id) ?? `Archivo #${task.source_file_id}`}</strong>
+                        {task.error_message ? ` · ${task.error_message}` : ""}
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
         </section>
       ) : null}
         </section>

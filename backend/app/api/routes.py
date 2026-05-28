@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO
 from uuid import uuid4
@@ -29,6 +30,41 @@ from app.services.pdf_exporter import export_vige_pdf
 from app.workers.tasks import process_source_file
 
 router = APIRouter()
+
+TERMINAL_BATCH_STATUSES = {"completed", "failed", "completed_with_errors"}
+
+
+def _refresh_batch_status(batch: ProcessingBatch) -> None:
+    if batch.processed_files + batch.failed_files < batch.total_files:
+        batch.status = "processing"
+        return
+
+    if batch.failed_files == 0:
+        batch.status = "completed"
+    elif batch.processed_files == 0:
+        batch.status = "failed"
+    else:
+        batch.status = "completed_with_errors"
+
+
+def _mark_task_as_failed(
+    db: Session,
+    *,
+    batch: ProcessingBatch,
+    source_file: SourceFile,
+    task_row: BatchTask,
+    message: str,
+) -> None:
+    source_file.status = "failed"
+    task_row.status = "failed"
+    task_row.error_message = message[:2000]
+    task_row.completed_at = datetime.utcnow()
+    batch.failed_files += 1
+    _refresh_batch_status(batch)
+    db.add(source_file)
+    db.add(task_row)
+    db.add(batch)
+    db.commit()
 
 
 @router.post("/auth/login", response_model=TokenOut)
@@ -134,10 +170,6 @@ def upload_pdfs(
         filename = f.filename or "archivo_sin_nombre.pdf"
         unique_name = f"{uuid4()}_{filename}"
         target = upload_dir / unique_name
-        try:
-            _save_uploaded_file(f, target)
-        finally:
-            f.file.close()
 
         entity = SourceFile(
             filename=filename,
@@ -146,40 +178,79 @@ def upload_pdfs(
             page_count=0,
             requires_ocr=False,
         )
-        db.add(entity)
-        db.commit()
+        try:
+            db.add(entity)
+            db.commit()
+        except Exception:
+            db.rollback()
+            batch.failed_files += 1
+            _refresh_batch_status(batch)
+            db.add(batch)
+            db.commit()
+            f.file.close()
+            continue
+
+        task_id = str(uuid4())
+        task_row = BatchTask(
+            batch_id=batch.id,
+            source_file_id=entity.id,
+            task_id=task_id,
+            status="queued",
+            error_message=None,
+        )
+        try:
+            db.add(task_row)
+            db.commit()
+        except Exception:
+            db.rollback()
+            entity.status = "failed"
+            batch.failed_files += 1
+            _refresh_batch_status(batch)
+            db.add(entity)
+            db.add(batch)
+            db.commit()
+            f.file.close()
+            continue
 
         try:
-            task_id = str(uuid4())
-            process_source_file.apply_async(args=[batch.id, entity.id], task_id=task_id)
-            db.add(
-                BatchTask(
-                    batch_id=batch.id,
-                    source_file_id=entity.id,
-                    task_id=task_id,
-                    status="queued",
-                    error_message=None,
-                )
-            )
-            db.commit()
+            _save_uploaded_file(f, target)
         except Exception as exc:
-            db.rollback()
             if target.exists():
                 target.unlink()
-            entity = db.query(SourceFile).filter(SourceFile.id == entity.id).first()
-            if entity is not None:
-                entity.status = "failed"
-                db.add(entity)
-            batch = db.query(ProcessingBatch).filter(ProcessingBatch.id == batch.id).first()
-            if batch is not None:
-                batch.failed_files += 1
-                batch.status = "processing"
-                db.add(batch)
-            db.commit()
-            raise HTTPException(
-                status_code=500,
-                detail=f"No se pudo procesar el PDF {filename}.",
-            ) from exc
+            _mark_task_as_failed(
+                db,
+                batch=batch,
+                source_file=entity,
+                task_row=task_row,
+                message=f"No se pudo guardar el PDF {filename}: {exc}",
+            )
+            continue
+        finally:
+            f.file.close()
+
+        try:
+            process_source_file.apply_async(
+                args=[batch.id, entity.id],
+                task_id=task_id,
+                retry=True,
+                retry_policy={
+                    "max_retries": 5,
+                    "interval_start": 0,
+                    "interval_step": 0.5,
+                    "interval_max": 3,
+                },
+            )
+        except Exception as exc:
+            if target.exists():
+                target.unlink()
+            _mark_task_as_failed(
+                db,
+                batch=batch,
+                source_file=entity,
+                task_row=task_row,
+                message=f"No se pudo encolar la tarea para {filename}: {exc}",
+            )
+            continue
 
     return BatchAcceptedOut(batch_id=batch.id, status=batch.status, total_files=batch.total_files)
 
@@ -201,6 +272,25 @@ def get_batch_status(
         .order_by(BatchTask.id.asc())
         .all()
     )
+
+    # Reconciliación defensiva: evita lotes pegados si hubo desalineación de contadores.
+    processed_count = sum(1 for task in tasks if task.status == "completed")
+    failed_count = sum(1 for task in tasks if task.status == "failed")
+    if batch.processed_files != processed_count or batch.failed_files != failed_count:
+        batch.processed_files = processed_count
+        batch.failed_files = failed_count
+        _refresh_batch_status(batch)
+        db.add(batch)
+        db.commit()
+        db.refresh(batch)
+
+    # Si todas las tareas están terminales, fuerza estado terminal del lote.
+    if tasks and all(task.status in {"completed", "failed"} for task in tasks):
+        if batch.status not in TERMINAL_BATCH_STATUSES:
+            _refresh_batch_status(batch)
+            db.add(batch)
+            db.commit()
+            db.refresh(batch)
 
     return BatchStatusOut(
         batch_id=batch.id,
