@@ -1,0 +1,7 @@
+.next
+node_modules
+pnpm-debug.log*
+Dockerfile
+.dockerignore
+.env.local
+.env

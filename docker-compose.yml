@@ -1,0 +1,126 @@
+x-backend-env: &backend-env
+  ENVIRONMENT: ${ENVIRONMENT:-development}
+  APP_NAME: ${APP_NAME:-VIGE API}
+  APP_HOST: 0.0.0.0
+  APP_PORT: 8000
+  API_DOCS_ENABLED: ${API_DOCS_ENABLED:-true}
+  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-vige}:${POSTGRES_PASSWORD:-vige_dev_password}@postgres:5432/${POSTGRES_DB:-vige}
+  UPLOAD_DIR: /app/uploads
+  OUTPUT_DIR: /app/outputs
+  FRONTEND_BASE_URL: ${FRONTEND_BASE_URL:-http://localhost:3000}
+  CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+  TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1}
+  FORCE_HTTPS_REDIRECT: ${FORCE_HTTPS_REDIRECT:-false}
+  MAX_PDFS_PER_BATCH: ${MAX_PDFS_PER_BATCH:-70}
+  UPLOAD_CHUNK_SIZE_BYTES: ${UPLOAD_CHUNK_SIZE_BYTES:-1048576}
+  REDIS_URL: redis://redis:6379/0
+  CELERY_RESULT_BACKEND: redis://redis:6379/1
+  CELERY_WORKER_CONCURRENCY: ${CELERY_WORKER_CONCURRENCY:-8}
+  CELERY_MAX_TASKS_PER_CHILD: ${CELERY_MAX_TASKS_PER_CHILD:-50}
+  AUTH_JWT_SECRET_KEY: ${AUTH_JWT_SECRET_KEY:-change-me-in-production}
+  AUTH_JWT_ALGORITHM: ${AUTH_JWT_ALGORITHM:-HS256}
+  AUTH_ACCESS_TOKEN_EXPIRE_MINUTES: ${AUTH_ACCESS_TOKEN_EXPIRE_MINUTES:-60}
+  AUTH_PASSWORD_RESET_EXPIRE_MINUTES: ${AUTH_PASSWORD_RESET_EXPIRE_MINUTES:-30}
+  AUTH_DEBUG_RETURN_RESET_TOKEN: ${AUTH_DEBUG_RETURN_RESET_TOKEN:-false}
+  AUTH_ALLOWED_EMAILS: ${AUTH_ALLOWED_EMAILS:-}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-vige}
+      POSTGRES_USER: ${POSTGRES_USER:-vige}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vige_dev_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend-api:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    command: ["sh", "./start.sh"]
+    environment:
+      <<: *backend-env
+      PORT: 8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - backend_uploads:/app/uploads
+      - backend_outputs:/app/outputs
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  backend-worker:
+    build:
+      context: ./backend
+    command: ["sh", "./worker.sh"]
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend-api:
+        condition: service_healthy
+    volumes:
+      - backend_uploads:/app/uploads
+      - backend_outputs:/app/outputs
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend-api:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
+  backend_uploads:
+  backend_outputs:

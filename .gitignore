@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+backend/.venv/
+backend/.pycache/
+backend/uploads/
+backend/outputs/
+backend/vige.db
+backend/.env
+backend/*.egg-info/
+
+# Node
+frontend/node_modules/
+frontend/.next/
+frontend/.env.local
+frontend/.env*.local
+frontend/*.tsbuildinfo
+
+# OS
+.DS_Store
+
+# Docker compose env
+.env

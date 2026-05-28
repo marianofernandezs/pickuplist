@@ -1,0 +1,51 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-body: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+  --font-title: "Georgia", "Times New Roman", serif;
+  --ap-green-900: #0f3a2f;
+  --ap-green-800: #135241;
+  --ap-green-700: #17735a;
+  --ap-green-500: #23a07d;
+  --ap-sand-100: #f2f6f2;
+  --ap-sand-50: #f9fcf9;
+  --ap-ink: #0d2f26;
+  --ap-sky: #d8ecf8;
+  --ap-line: #d2dfd8;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  color: var(--ap-ink);
+  font-family: var(--font-body), sans-serif;
+  background:
+    radial-gradient(circle at 8% 12%, #d7f0e5 0, transparent 34%),
+    radial-gradient(circle at 92% 8%, #d8ecf8 0, transparent 28%),
+    linear-gradient(130deg, #ecf5ef 0%, #e6f0ea 42%, #dceaf1 100%);
+  min-height: 100vh;
+}
+
+.brand-title {
+  font-family: var(--font-title), serif;
+  letter-spacing: 0.02em;
+}
+
+.login-noise {
+  position: relative;
+}
+
+.login-noise::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: radial-gradient(rgba(255, 255, 255, 0.28) 0.8px, transparent 0.8px);
+  background-size: 4px 4px;
+  pointer-events: none;
+  opacity: 0.25;
+}
