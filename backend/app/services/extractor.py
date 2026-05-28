@@ -100,6 +100,67 @@ def _parse_collapsed_glosa_cell(cell_text: str) -> tuple[str, str] | None:
     return glosa, cantidad
 
 
+def _strip_leading_sku_token(row_text: str, assume_present: bool) -> tuple[str | None, str]:
+    normalized = " ".join(row_text.replace("\n", " ").split())
+    if not normalized:
+        return None, normalized
+
+    parts = normalized.split(" ", 1)
+    first = parts[0].strip()
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    first_upper = first.upper()
+
+    if not rest:
+        return None, normalized
+
+    if first_upper in {"SKU", "GLOSA", "CANTIDAD"}:
+        return None, normalized
+    if re.search(r"^\$|^\d+$", first_upper):
+        return None, normalized
+
+    is_token_like_code = re.fullmatch(r"[A-Z0-9\-_/\.]+", first_upper) is not None
+    if not is_token_like_code:
+        return None, normalized
+
+    if assume_present:
+        return first_upper, rest
+
+    if any(ch.isdigit() for ch in first_upper):
+        return first_upper, rest
+
+    return None, normalized
+
+
+def _parse_collapsed_product_row(row_text: str, assume_leading_sku: bool) -> tuple[str | None, str, str] | None:
+    sku, candidate_text = _strip_leading_sku_token(row_text, assume_present=assume_leading_sku)
+    parsed = _parse_collapsed_glosa_cell(candidate_text)
+    if not parsed:
+        return None
+
+    glosa, cantidad = parsed
+    detected_sku = sku or detect_sku(glosa)
+    return detected_sku, glosa, cantidad
+
+
+def _is_excluded_glosa(glosa: str) -> bool:
+    glosa_upper = glosa.upper()
+    return any(
+        token in glosa_upper
+        for token in (
+            "TOTAL",
+            "SUBTOTAL",
+            "NETO",
+            "IVA",
+            "DESCUENTO",
+            "PAGO",
+            "CLIENTE",
+            "PROVEEDOR",
+            "OBSERVACIONES",
+            "SISTEMA DE GESTION",
+        )
+    )
+
+
 def parse_pdf(db: Session, source_file: SourceFile) -> None:
     path = Path(source_file.stored_path)
     doc = fitz.open(path)
@@ -126,52 +187,73 @@ def parse_pdf(db: Session, source_file: SourceFile) -> None:
         db.flush()
 
     with pdfplumber.open(path) as pdf:
+        last_header_indexes: tuple[int, int] | None = None
+        has_sku_header = False
+
         for page_number, page in enumerate(pdf.pages, start=1):
             tables = page.extract_tables()
             for table in tables:
                 if not table:
                     continue
-                header_indexes = _find_header_indexes(table[0])
-                if not header_indexes:
-                    continue
 
-                glosa_idx, cantidad_idx = header_indexes
-                for row in table[1:]:
+                current_header_indexes = _find_header_indexes(table[0])
+                if current_header_indexes:
+                    last_header_indexes = current_header_indexes
+                    header_cells = [_norm_header(cell) if cell else "" for cell in table[0]]
+                    has_sku_header = any("sku" in cell for cell in header_cells)
+                    rows = table[1:]
+                else:
+                    rows = table
+
+                glosa_idx: int | None = None
+                cantidad_idx: int | None = None
+                if last_header_indexes:
+                    glosa_idx, cantidad_idx = last_header_indexes
+
+                for row in rows:
                     if not row:
                         continue
-                    if glosa_idx >= len(row) or cantidad_idx >= len(row):
+
+                    non_empty_cells = [cell.strip() for cell in row if cell and cell.strip()]
+                    if not non_empty_cells:
                         continue
 
-                    glosa = (row[glosa_idx] or "").strip()
-                    cantidad_raw = (row[cantidad_idx] or "").strip()
+                    sku: str | None = None
+                    glosa = ""
+                    cantidad_raw = ""
 
-                    if glosa and not cantidad_raw:
-                        collapsed = _parse_collapsed_glosa_cell(glosa)
-                        if collapsed:
-                            glosa, cantidad_raw = collapsed
+                    # Caso colapsado: la fila completa viene en una sola celda.
+                    if len(non_empty_cells) == 1:
+                        parsed = _parse_collapsed_product_row(
+                            non_empty_cells[0],
+                            assume_leading_sku=has_sku_header,
+                        )
+                        if not parsed:
+                            continue
+                        sku, glosa, cantidad_raw = parsed
+                    elif glosa_idx is not None and cantidad_idx is not None:
+                        if glosa_idx >= len(row) or cantidad_idx >= len(row):
+                            continue
+                        glosa = (row[glosa_idx] or "").strip()
+                        cantidad_raw = (row[cantidad_idx] or "").strip()
+
+                        if glosa and not cantidad_raw:
+                            collapsed = _parse_collapsed_product_row(
+                                glosa,
+                                assume_leading_sku=has_sku_header,
+                            )
+                            if collapsed:
+                                sku, glosa, cantidad_raw = collapsed
 
                     if not glosa or not cantidad_raw:
                         continue
 
-                    # Excluye líneas administrativas o de totales.
-                    glosa_upper = glosa.upper()
-                    if any(
-                        token in glosa_upper
-                        for token in (
-                            "TOTAL",
-                            "SUBTOTAL",
-                            "NETO",
-                            "IVA",
-                            "DESCUENTO",
-                            "PAGO",
-                            "CLIENTE",
-                            "PROVEEDOR",
-                        )
-                    ):
+                    if _is_excluded_glosa(glosa):
                         continue
 
                     parsed_qty = parse_quantity_cell(cantidad_raw)
-                    sku = detect_sku(glosa)
+                    if sku is None:
+                        sku = detect_sku(glosa)
 
                     db.add(
                         ProductCandidate(
