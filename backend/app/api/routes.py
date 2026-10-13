@@ -365,6 +365,7 @@ def export_pickeo_bodega_pdf(db: Session = Depends(get_db), current_user: User =
         path,
         title="Lista Pickeo Bodega",
         allowed_presentations=("caja",),
+        include_document_summary=True,
     )
     return FileResponse(path=str(path), media_type="application/pdf", filename="Lista Pickeo Bodega.pdf")
 
