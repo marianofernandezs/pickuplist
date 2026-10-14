@@ -12,8 +12,22 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.session import get_db
-from app.models.entities import BatchTask, ProcessingBatch, ProductCandidate, SourceFile, User
-from app.schemas.auth import ForgotPasswordOut, ForgotPasswordRequest, LoginRequest, ResetPasswordRequest, TokenOut, UserOut
+from app.models.entities import (
+    BatchTask,
+    ProcessingBatch,
+    ProductCandidate,
+    SourceDocumentMetadata,
+    SourceFile,
+    User,
+)
+from app.schemas.auth import (
+    ForgotPasswordOut,
+    ForgotPasswordRequest,
+    LoginRequest,
+    ResetPasswordRequest,
+    TokenOut,
+    UserOut,
+)
 from app.schemas.queue import BatchAcceptedOut, BatchStatusOut, BatchTaskOut
 from app.schemas.vige import ProductOut, SourceFileOut
 from app.security import create_access_token, get_current_user, get_password_hash
@@ -410,6 +424,7 @@ def reset_iteration(db: Session = Depends(get_db), current_user: User = Depends(
     db.execute(text("DELETE FROM extracted_lines"))
     db.query(BatchTask).delete()
     db.query(ProcessingBatch).delete()
+    db.query(SourceDocumentMetadata).delete()
     db.query(SourceFile).delete()
     db.commit()
 
