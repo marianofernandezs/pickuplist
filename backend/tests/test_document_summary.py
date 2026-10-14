@@ -7,9 +7,15 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.db.session import Base
-from app.models.entities import ExtractedLine, ProductCandidate, SourceFile
+from app.models.entities import (
+    ExtractedLine,
+    ProductCandidate,
+    SourceDocumentMetadata,
+    SourceFile,
+)
 from app.services.document_summary import (
     collect_document_summaries,
+    extract_document_summary,
     parse_document_summary,
 )
 from app.services.pdf_exporter import export_vige_pdf
@@ -55,7 +61,7 @@ def test_missing_fields_and_unrelated_numbers():
     summary = parse_document_summary(["FACTURA ELECTRÓNICA", "S.I.I. - ARICA",
                                       "BANDEJA N° 5", "Resolución Ex. SII N° 80 de 2014"])
     assert summary.number == "No identificado"
-    assert summary.payment_condition == "No informada"
+    assert summary.payment_condition is None
     assert parse_document_summary([]) == summary
 
 
@@ -64,6 +70,107 @@ def test_multiline_and_inline_payment():
         summary = parse_document_summary(["FACTURA ELECTRÓNICA", "N º 123", "S.I.I. - ARICA",
                                           *label.splitlines(), "30 DIAS", "OBSERVACIONES", "Entregar mañana"])
         assert summary.payment_condition == "CREDITO 30 DIAS"
+
+
+@pytest.mark.parametrize("lines, expected", [
+    (["Condiciones de", "pago", "Contado", "OBSERVACIONES"], "Contado"),
+    (["Condición de pago: Crédito", "30 días", "Vencimiento: 01-01-2027"], "Crédito 30 días"),
+    (["Cliente: Empresa Condiciones Pago: CONTADO Fecha: 01-01-2027"], "CONTADO"),
+    (["CONDICIONES DE VENTA", "Crédito 60 días", "Monto Neto"], "Crédito 60 días"),
+    (["Forma de Pago: Transferencia bancaria", "Monto Neto"], "Transferencia bancaria"),
+    (["Forma de pago: Transferencia", "Condiciones de pago: Crédito 30 días"], "Crédito 30 días"),
+    (["Condiciones de pago:", "Vencimiento: 01-01-2027", "Cliente: Empresa"], None),
+])
+def test_payment_label_variants(lines, expected):
+    assert parse_document_summary(lines).payment_condition == expected
+
+
+@pytest.mark.parametrize("layout", ["right", "below", "wrapped", "reversed", "continuation"])
+def test_pdf_geometry_finds_payment_without_relying_on_text_order(layout):
+    with fitz.open() as pdf:
+        page = pdf.new_page()
+        page.insert_text((40, 40), "FACTURA ELECTRONICA")
+        page.insert_text((40, 60), "N º 123")
+        if layout == "reversed":
+            page.insert_text((250, 100), "CREDITO 30 DIAS")
+            page.insert_text((40, 100), "Condiciones de pago:")
+        elif layout == "wrapped":
+            page.insert_text((40, 100), "Condiciones de")
+            page.insert_text((40, 114), "pago")
+            page.insert_text((250, 107), "CREDITO 30 DIAS")
+        elif layout == "below":
+            page.insert_text((40, 100), "Condiciones de pago")
+            page.insert_text((300, 100), "Fecha")
+            page.insert_text((300, 120), "01-01-2027")
+            page.insert_text((40, 120), "CREDITO 30 DIAS")
+        elif layout == "continuation":
+            page.insert_text((40, 100), "Condiciones de pago")
+            page.insert_text((250, 100), "CREDITO")
+            page.insert_text((250, 114), "30 DIAS")
+        else:
+            page.insert_text((40, 100), "Condiciones de pago")
+            page.insert_text((250, 100), "CREDITO 30 DIAS")
+        page.insert_text((40, 145), "Observaciones")
+        page.insert_text((40, 165), "ENTREGAR POR LA TARDE")
+        summary = extract_document_summary(pdf)
+        assert summary.number == "123"
+        assert summary.payment_condition == "CREDITO 30 DIAS"
+
+
+def test_processing_persists_metadata_and_export_uses_it(db, tmp_path):
+    from app.services.extractor import parse_pdf
+
+    path = tmp_path / "invoice.pdf"
+    with fitz.open() as pdf:
+        page = pdf.new_page()
+        page.insert_text((40, 40), "FACTURA ELECTRONICA\nN º 321")
+        page.insert_text((40, 100), "Condiciones de\npago")
+        page.insert_text((250, 107), "CREDITO 60 DIAS")
+        pdf.save(path)
+    source = SourceFile(filename=path.name, stored_path=str(path))
+    db.add(source)
+    db.commit()
+    parse_pdf(db, source)
+    parse_pdf(db, source)
+    metadata, = db.query(SourceDocumentMetadata).all()
+    assert metadata.document_number == "321"
+    assert metadata.payment_condition == "CREDITO 60 DIAS"
+    path.unlink()
+    summary, = collect_document_summaries(db)
+    assert summary.payment_condition == "CREDITO 60 DIAS"
+
+
+def test_pdf_missing_payment_does_not_use_observations():
+    with fitz.open() as pdf:
+        page = pdf.new_page()
+        page.insert_text((40, 100), "Condiciones de pago")
+        page.insert_text((40, 120), "Observaciones")
+        page.insert_text((40, 140), "ENTREGAR POR LA TARDE")
+        assert extract_document_summary(pdf).payment_condition is None
+
+
+def test_legacy_upload_reads_pdf_and_reset_deletes_metadata(db, tmp_path, monkeypatch):
+    from app.api import routes
+
+    path = tmp_path / "legacy.pdf"
+    with fitz.open() as pdf:
+        page = pdf.new_page()
+        page.insert_text((40, 40), "FACTURA ELECTRONICA\nN º 444")
+        page.insert_text((40, 100), "Condiciones de\npago")
+        page.insert_text((250, 107), "Contado")
+        pdf.save(path)
+    source = SourceFile(filename=path.name, stored_path=str(path), status="processed")
+    db.add(source)
+    db.commit()
+    summary, = collect_document_summaries(db)
+    assert summary.number == "444"
+    assert summary.payment_condition == "Contado"
+    db.add(SourceDocumentMetadata(source_file_id=source.id, document_number="444", payment_condition="Contado"))
+    db.commit()
+    monkeypatch.setattr(routes.settings, "output_dir", str(tmp_path))
+    routes.reset_iteration(db=db, current_user=None)
+    assert db.query(SourceDocumentMetadata).count() == 0
+    assert db.query(SourceFile).count() == 0
 
 
 def test_processed_documents_ordered_by_upload_once_per_file(db):
@@ -84,7 +191,7 @@ def test_existing_processed_document_without_text(db):
     db.flush()
     summary, = collect_document_summaries(db)
     assert summary.number == "No identificado"
-    assert summary.payment_condition == "No informada"
+    assert summary.payment_condition is None
 
 
 def test_summary_only_when_enabled_and_independent_of_products(db, tmp_path):

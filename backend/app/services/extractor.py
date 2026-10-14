@@ -9,8 +9,14 @@ import fitz
 import pdfplumber
 from sqlalchemy.orm import Session
 
-from app.models.entities import ExtractedLine, ProductCandidate, SourceFile
+from app.models.entities import (
+    ExtractedLine,
+    ProductCandidate,
+    SourceDocumentMetadata,
+    SourceFile,
+)
 from app.services.classifier import detect_sku, parse_quantity_cell
+from app.services.document_summary import extract_document_summary
 from app.services.registro_interno_parser import parseRegistroInternoBuffer
 
 REGISTRO_SKU_PATTERN = re.compile(r"^(?:BODEGA[A-Z0-9]+|LOCAL[A-Z0-9]+)\b", re.IGNORECASE)
@@ -402,6 +408,13 @@ def parse_pdf(db: Session, source_file: SourceFile) -> list[ParsedProduct]:
     has_selectable_text = False
 
     with fitz.open(path) as doc:
+        summary = extract_document_summary(doc)
+        metadata = db.get(SourceDocumentMetadata, source_file.id)
+        if metadata is None:
+            metadata = SourceDocumentMetadata(source_file_id=source_file.id)
+        metadata.document_number = summary.number
+        metadata.payment_condition = summary.payment_condition
+        db.add(metadata)
         source_file.page_count = doc.page_count
         for page_index, page in enumerate(doc):
             text = page.get_text("text")

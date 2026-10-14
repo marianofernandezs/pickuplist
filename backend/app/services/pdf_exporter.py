@@ -55,7 +55,7 @@ def _draw_document_summary(c: canvas.Canvas, documents: list[DocumentSummary]) -
         # condition needs to continue on another page.
         bottom = 74 if document_index == len(documents) - 1 else 40
         cells = [_wrap_summary_text(value, col_width - 2 * padding)
-                 for value, col_width in zip((document.number, document.payment_condition), column_widths)]
+                 for value, col_width in zip((document.number, document.payment_condition or "No informada"), column_widths)]
         line_count = max(map(len, cells))
         row_height = line_count * line_height + 2 * padding
         if y - row_height < bottom:

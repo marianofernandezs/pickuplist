@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -19,6 +20,14 @@ class SourceFile(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     lines: Mapped[list[ExtractedLine]] = relationship("ExtractedLine", back_populates="source_file")
+
+
+class SourceDocumentMetadata(Base):
+    __tablename__ = "source_document_metadata"
+
+    source_file_id: Mapped[int] = mapped_column(ForeignKey("source_files.id"), primary_key=True)
+    document_number: Mapped[str] = mapped_column(String(128), nullable=False)
+    payment_condition: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ExtractedLine(Base):
