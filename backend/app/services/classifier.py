@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from app.services.quantity_validation import parse_integer_quantity
+
 
 @dataclass(frozen=True)
 class ClassificationResult:
@@ -53,13 +55,12 @@ def classify_presentation(text: str) -> ClassificationResult:
     return ClassificationResult(presentation="ambiguo", quantity=None, unit=None)
 
 
-def parse_quantity_cell(text: str) -> ClassificationResult:
+def parse_quantity_cell(text: str, description: str = "Producto sin descripción") -> ClassificationResult:
     """
     Parsea la columna Cantidad de factura (ej: '1 CAJA', '5 PACK', '30 UN').
     """
     normalized = " ".join(text.upper().split())
-    match = re.search(r"(\d+)", normalized)
-    quantity = int(match.group(1)) if match else None
+    quantity = parse_integer_quantity(normalized, description)
 
     if re.search(r"\bCAJA\b", normalized):
         return ClassificationResult(presentation="caja", quantity=quantity, unit="caja")

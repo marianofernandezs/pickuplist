@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.services.quantity_validation import parse_integer_quantity
+
 _MONEY_PATTERN = re.compile(r"\$\s*[\d.,]+")
 _SKU_PATTERN = re.compile(
     r"^(?P<sku>(?:BODEGA[A-Z0-9]+|LOCAL[A-Z0-9]+))\b\s+(?P<body>.+)$",
@@ -48,8 +50,10 @@ def parseRegistroInternoBuffer(buffer: str) -> dict[str, Any] | None:
     if not description:
         return None
 
-    raw_quantity = quantity_match.group("cantidad").replace(",", ".")
-    quantity = float(raw_quantity) if "." in raw_quantity else int(raw_quantity)
+    raw_quantity = quantity_match.group("cantidad")
+    quantity = parse_integer_quantity(raw_quantity, description)
+    if quantity is None:
+        return None
 
     return {
         "sku": sku,

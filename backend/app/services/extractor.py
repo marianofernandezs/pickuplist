@@ -3,21 +3,18 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import fitz
 import pdfplumber
-from sqlalchemy.orm import Session
-
-from app.models.entities import (
-    ExtractedLine,
-    ProductCandidate,
-    SourceDocumentMetadata,
-    SourceFile,
-)
 from app.services.classifier import detect_sku, parse_quantity_cell
-from app.services.document_summary import extract_document_summary
+from app.services.document_summary import DocumentSummary, extract_document_summary
 from app.services.registro_interno_parser import parseRegistroInternoBuffer
+from app.services.quantity_validation import InvalidProductQuantity, validate_integer_quantity
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+    from app.models.entities import SourceFile
 
 REGISTRO_SKU_PATTERN = re.compile(r"^(?:BODEGA[A-Z0-9]+|LOCAL[A-Z0-9]+)\b", re.IGNORECASE)
 REGISTRO_QUANTITY_PATTERN = re.compile(
@@ -34,7 +31,7 @@ REGISTRO_QUANTITY_LINE_PATTERN = re.compile(
 class ParsedProduct:
     sku: str | None
     descripcion_exacta: str
-    cantidad: int | float | None
+    cantidad: int | None
     tipo_presentacion: str
     page_number: int
     unit: str | None = None
@@ -107,7 +104,7 @@ def _parsed_registry_product(parsed: dict[str, Any], page_number: int) -> Parsed
 
 def _dedupe_products(products: list[ParsedProduct]) -> list[ParsedProduct]:
     unique: list[ParsedProduct] = []
-    seen: set[tuple[int, str, str, int | float | None, str]] = set()
+    seen: set[tuple[int, str, str, int | None, str]] = set()
     for product in products:
         key = (
             product.page_number,
@@ -382,7 +379,7 @@ def _extract_table_products(path: Path, *, registro_interno: bool) -> list[Parse
                     if _is_excluded_glosa(glosa):
                         continue
 
-                    parsed_qty = parse_quantity_cell(cantidad_raw)
+                    parsed_qty = parse_quantity_cell(cantidad_raw, description=glosa)
                     if sku is None:
                         sku = detect_sku(glosa)
 
@@ -401,21 +398,27 @@ def _extract_table_products(path: Path, *, registro_interno: bool) -> list[Parse
     return products
 
 
-def parse_pdf(db: Session, source_file: SourceFile) -> list[ParsedProduct]:
-    path = Path(source_file.stored_path)
+@dataclass(frozen=True)
+class PdfExtraction:
+    """Database-free result of parsing one source PDF."""
+
+    products: list[ParsedProduct]
+    summary: DocumentSummary
+    page_count: int
+    requires_ocr: bool
+    lines_by_page: list[list[str]]
+
+
+def extract_pdf(path: str | Path) -> PdfExtraction:
+    """Extract business data from a PDF without FastAPI, SQLAlchemy or a server."""
+    path = Path(path)
     page_texts: list[str] = []
     lines_by_page: list[list[str]] = []
     has_selectable_text = False
 
     with fitz.open(path) as doc:
         summary = extract_document_summary(doc)
-        metadata = db.get(SourceDocumentMetadata, source_file.id)
-        if metadata is None:
-            metadata = SourceDocumentMetadata(source_file_id=source_file.id)
-        metadata.document_number = summary.number
-        metadata.payment_condition = summary.payment_condition
-        db.add(metadata)
-        source_file.page_count = doc.page_count
+        page_count = doc.page_count
         for page_index, page in enumerate(doc):
             text = page.get_text("text")
             lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -425,31 +428,50 @@ def parse_pdf(db: Session, source_file: SourceFile) -> list[ParsedProduct]:
             if lines:
                 has_selectable_text = True
 
-            for block_index, line in enumerate(lines):
-                db.add(
-                    ExtractedLine(
-                        source_file_id=source_file.id,
-                        page_number=page_index + 1,
-                        block_index=block_index,
-                        raw_text=line,
-                    )
-                )
-            db.flush()
 
-    registro_interno = is_registro_interno_document(page_texts)
-    table_products = _extract_table_products(path, registro_interno=registro_interno)
-    products = table_products
+    try:
+        registro_interno = is_registro_interno_document(page_texts)
+        table_products = _extract_table_products(path, registro_interno=registro_interno)
+        products = table_products
 
-    if registro_interno:
-        line_products: list[ParsedProduct] = []
-        for page_number, lines in enumerate(lines_by_page, start=1):
-            for _, buffer in build_registro_interno_buffers(lines):
-                parsed = parseRegistroInternoBuffer(buffer)
-                if parsed is not None:
-                    line_products.append(_parsed_registry_product(parsed, page_number))
-        products = _merge_registry_products(table_products, line_products)
+        if registro_interno:
+            line_products: list[ParsedProduct] = []
+            for page_number, lines in enumerate(lines_by_page, start=1):
+                for _, buffer in build_registro_interno_buffers(lines):
+                    parsed = parseRegistroInternoBuffer(buffer)
+                    if parsed is not None:
+                        line_products.append(_parsed_registry_product(parsed, page_number))
+            products = _merge_registry_products(table_products, line_products)
 
-    for product in products:
+        # Final shared boundary: no parser result may escape extraction unless
+        # every product has an integer quantity. Persistence and Desktop both
+        # consume only this complete PdfExtraction result.
+        for product in products:
+            validate_integer_quantity(product.cantidad, product.descripcion_exacta)
+    except InvalidProductQuantity as exc:
+        raise exc.for_document(path.name) from exc
+
+    return PdfExtraction(products, summary, page_count, not has_selectable_text, lines_by_page)
+
+
+def parse_pdf(db: Session, source_file: SourceFile) -> list[ParsedProduct]:
+    """Compatibility adapter that persists the database-free extraction result."""
+    from app.models.entities import ExtractedLine, ProductCandidate, SourceDocumentMetadata
+
+    result = extract_pdf(source_file.stored_path)
+    metadata = db.get(SourceDocumentMetadata, source_file.id)
+    if metadata is None:
+        metadata = SourceDocumentMetadata(source_file_id=source_file.id)
+    metadata.document_number = result.summary.number
+    metadata.payment_condition = result.summary.payment_condition
+    db.add(metadata)
+    source_file.page_count = result.page_count
+    for page_number, lines in enumerate(result.lines_by_page, start=1):
+        for block_index, line in enumerate(lines):
+            db.add(ExtractedLine(source_file_id=source_file.id, page_number=page_number,
+                                 block_index=block_index, raw_text=line))
+    db.flush()
+    for product in result.products:
         db.add(
             ProductCandidate(
                 source_file_id=source_file.id,
@@ -464,8 +486,8 @@ def parse_pdf(db: Session, source_file: SourceFile) -> list[ParsedProduct]:
             )
         )
 
-    source_file.requires_ocr = not has_selectable_text
-    source_file.status = "processed" if has_selectable_text else "requires_ocr"
+    source_file.requires_ocr = result.requires_ocr
+    source_file.status = "processed" if not result.requires_ocr else "requires_ocr"
     db.add(source_file)
     db.commit()
-    return products
+    return result.products

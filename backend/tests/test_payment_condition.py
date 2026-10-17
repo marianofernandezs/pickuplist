@@ -89,7 +89,7 @@ def test_reader_persists_none_and_export_keeps_missing_value_label(tmp_path):
             assert metadata.payment_condition is None
             output = export_vige_pdf(db, tmp_path / "export.pdf", include_document_summary=True)
             with fitz.open(output) as result:
-                assert "No informada" in result[-1].get_text()
+                assert "NO INFORMADA" in result[-1].get_text()
                 assert "Total facturas: 1" in result[-1].get_text()
     finally:
         engine.dispose()

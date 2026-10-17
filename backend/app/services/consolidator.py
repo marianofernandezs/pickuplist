@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from sqlalchemy.orm import Session
-
-from app.models.entities import ProductCandidate
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
 
 
 @dataclass(frozen=True)
@@ -22,7 +22,14 @@ def _normalize_description(text: str) -> str:
 
 
 def consolidate_products(db: Session) -> list[ConsolidatedProduct]:
+    from app.models.entities import ProductCandidate
+
     rows = db.query(ProductCandidate).all()
+    return consolidate_product_rows(rows)
+
+
+def consolidate_product_rows(rows) -> list[ConsolidatedProduct]:
+    """Apply the existing grouping, quantity sum and ordering to product rows."""
 
     grouped: dict[tuple[str, str], ConsolidatedProduct] = {}
 
