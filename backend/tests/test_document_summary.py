@@ -14,11 +14,12 @@ from app.models.entities import (
     SourceFile,
 )
 from app.services.document_summary import (
+    DocumentSummary,
     collect_document_summaries,
     extract_document_summary,
     parse_document_summary,
 )
-from app.services.pdf_exporter import export_vige_pdf
+from app.services.pdf_exporter import export_vige_pdf, export_vige_products
 
 
 @pytest.fixture
@@ -208,7 +209,7 @@ def test_summary_only_when_enabled_and_independent_of_products(db, tmp_path):
             if enabled:
                 assert "Codigo de facturas escaneadas" in pdf[-1].get_text()
                 assert "123" in pdf[-1].get_text()
-                assert "Contado" in pdf[-1].get_text()
+                assert "CONTADO" in pdf[-1].get_text()
                 assert "Total facturas: 1" in pdf[-1].get_text()
             else:
                 assert "Total facturas" not in pdf[0].get_text()
@@ -255,6 +256,35 @@ def test_only_bodega_route_enables_summary(db, tmp_path, monkeypatch):
     assert all(not call.get("include_document_summary", False) for call in calls[1:])
 
 
+@pytest.mark.parametrize(
+    ("payment_condition", "expected"),
+    [
+        ("Contado", "CONTADO"),
+        ("Credito 30 dias", "CREDITO 30 DIAS"),
+        ("Crédito 30 días", "CRÉDITO 30 DÍAS"),
+        ("registro interno stock", "REGISTRO INTERNO STOCK"),
+        (None, "NO INFORMADA"),
+        ("", "NO INFORMADA"),
+    ],
+)
+def test_exported_summary_uppercases_payment_or_type_without_changing_source(
+    payment_condition, expected, tmp_path,
+):
+    source_summary = DocumentSummary("SYN-123", payment_condition)
+    path = export_vige_products(
+        [], tmp_path / "summary.pdf",
+        document_summaries=[source_summary],
+        include_document_summary=True,
+    )
+
+    with fitz.open(path) as pdf:
+        assert len(pdf) == 2
+        summary_text = pdf[-1].get_text()
+
+    assert expected in summary_text
+    assert source_summary.payment_condition == payment_condition
+
+
 @pytest.mark.parametrize("document_count", [28, 29, 30])
 def test_total_counts_only_included_files_and_fits_on_final_page(db, tmp_path, document_count):
     for number in range(1000, 1000 + document_count - 1):
@@ -271,7 +301,7 @@ def test_total_counts_only_included_files_and_fits_on_final_page(db, tmp_path, d
         text = "\n".join(page.get_text() for page in pdf)
         assert text.count("Total facturas:") == 1
         assert f"Total facturas: {document_count}" in pdf[-1].get_text()
-        assert "registro interno stock" in pdf[-1].get_text()
+        assert "REGISTRO INTERNO STOCK" in pdf[-1].get_text()
         assert "999" not in text
         total_block, = [block for block in pdf[-1].get_text("blocks") if "Total facturas:" in block[4]]
         assert total_block[3] <= pdf[-1].rect.height - 39

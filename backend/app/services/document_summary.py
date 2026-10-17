@@ -5,11 +5,12 @@ import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import fitz
-from sqlalchemy.orm import Session
 
-from app.models.entities import ExtractedLine, SourceDocumentMetadata, SourceFile
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
 
 
 @dataclass(frozen=True)
@@ -95,7 +96,7 @@ def parse_document_summary(lines: Sequence[str]) -> DocumentSummary:
         heading = re.split(r"S\.I\.I\.|Señor\(es\)|Fecha\b|SKU\b|Glosa\b", text[header.end():],
                            maxsplit=1, flags=re.IGNORECASE)[0]
         number = NUMBER_PATTERN.search(heading)
-    payment = 'Registro Interno Stock' if registry else _payment_from_lines(cleaned)
+    payment = 'registro interno stock' if registry else _payment_from_lines(cleaned)
     return DocumentSummary(number.group(1) if number else 'No identificado', payment)
 
 
@@ -180,12 +181,14 @@ def extract_payment_condition(document: fitz.Document) -> str | None:
 def extract_document_summary(document: fitz.Document) -> DocumentSummary:
     texts = [page.get_text('text') for page in document]
     summary = parse_document_summary([line for text in texts for line in text.splitlines()])
-    if summary.payment_condition == 'Registro Interno Stock':
+    if summary.payment_condition == 'registro interno stock':
         return summary
     return DocumentSummary(summary.number, extract_payment_condition(document))
 
 
 def collect_document_summaries(db: Session) -> list[DocumentSummary]:
+    from app.models.entities import ExtractedLine, SourceDocumentMetadata, SourceFile
+
     sources = db.query(SourceFile).filter(SourceFile.status == 'processed').order_by(
         SourceFile.created_at, SourceFile.id,
     ).all()

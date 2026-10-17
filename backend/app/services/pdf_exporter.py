@@ -2,16 +2,18 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.textsplit import wordSplit
 from reportlab.lib.utils import simpleSplit
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
-from sqlalchemy.orm import Session
-
 from app.services.consolidator import consolidate_products
 from app.services.document_summary import DocumentSummary, collect_document_summaries
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
 
 
 def _wrap_summary_text(value: str, width: float) -> list[str]:
@@ -54,8 +56,9 @@ def _draw_document_summary(c: canvas.Canvas, documents: list[DocumentSummary]) -
         # Keep the total together with the final row, including when a long
         # condition needs to continue on another page.
         bottom = 74 if document_index == len(documents) - 1 else 40
+        payment_type = (document.payment_condition or "No informada").upper()
         cells = [_wrap_summary_text(value, col_width - 2 * padding)
-                 for value, col_width in zip((document.number, document.payment_condition or "No informada"), column_widths)]
+                 for value, col_width in zip((document.number, payment_type), column_widths)]
         line_count = max(map(len, cells))
         row_height = line_count * line_height + 2 * padding
         if y - row_height < bottom:
@@ -94,6 +97,23 @@ def export_vige_pdf(
     include_document_summary: bool = False,
 ) -> Path:
     products = consolidate_products(db)
+    summaries = collect_document_summaries(db) if include_document_summary else []
+    return export_vige_products(
+        products, output_path, title=title, allowed_presentations=allowed_presentations,
+        document_summaries=summaries, include_document_summary=include_document_summary,
+    )
+
+
+def export_vige_products(
+    products,
+    output_path: Path,
+    *,
+    title: str = "Lista VIGE",
+    allowed_presentations: Iterable[str] | None = None,
+    document_summaries: list[DocumentSummary] | None = None,
+    include_document_summary: bool = False,
+) -> Path:
+    """Render the same PDF format from in-memory application data."""
     if allowed_presentations is not None:
         allowed = {item.lower() for item in allowed_presentations}
         products = [product for product in products if product.presentation.lower() in allowed]
@@ -144,7 +164,7 @@ def export_vige_pdf(
         y -= row_height
 
     if include_document_summary:
-        _draw_document_summary(c, collect_document_summaries(db))
+        _draw_document_summary(c, document_summaries or [])
 
     c.save()
     return output_path
