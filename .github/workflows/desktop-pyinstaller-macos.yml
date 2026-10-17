@@ -1,0 +1,72 @@
+name: Pick List Desktop macOS PyInstaller builds
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: macOS ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            python_arch: arm64
+            artifact_name: Pick-List-macOS-arm64
+          - runner: macos-15-intel
+            arch: x86_64
+            python_arch: x64
+            artifact_name: Pick-List-macOS-x86_64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.5"
+          enable-cache: false
+
+      - name: Install Python ${{ matrix.python_arch }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.13"
+          architecture: ${{ matrix.python_arch }}
+
+      - name: Verify lockfile
+        run: uv lock --project backend --check
+
+      - name: Synchronize locked application and test dependencies
+        run: >-
+          uv sync --project backend --locked --no-default-groups
+          --extra desktop --group test --python 3.12.13
+
+      - name: Install pinned PyInstaller build toolchain
+        run: >-
+          uv pip install --python backend/.venv/bin/python --no-deps
+          --requirements scripts/pyinstaller/requirements-macos.txt
+
+      - name: Run test suite
+        working-directory: backend
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: uv run --locked --no-sync --python 3.12.13 python -m pytest -q
+
+      - name: Build and validate standalone app
+        run: ./scripts/build-pyinstaller-macos.sh "${{ matrix.arch }}"
+
+      - name: Upload macOS ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/macos/pyinstaller/${{ matrix.arch }}/run-*/Pick-List-macOS-${{ matrix.arch }}.zip
+          if-no-files-found: error
+          retention-days: 14
