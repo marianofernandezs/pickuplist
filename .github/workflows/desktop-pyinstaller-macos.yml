@@ -15,11 +15,11 @@ jobs:
         include:
           - runner: macos-15
             arch: arm64
-            python_arch: arm64
+            expected_machine: arm64
             artifact_name: Pick-List-macOS-arm64
           - runner: macos-15-intel
             arch: x86_64
-            python_arch: x64
+            expected_machine: x86_64
             artifact_name: Pick-List-macOS-x86_64
     runs-on: ${{ matrix.runner }}
     defaults:
@@ -35,11 +35,34 @@ jobs:
           version: "0.12.5"
           enable-cache: false
 
-      - name: Install Python ${{ matrix.python_arch }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12.13"
-          architecture: ${{ matrix.python_arch }}
+      - name: Install managed Python 3.12.13
+        env:
+          EXPECTED_MACHINE: ${{ matrix.expected_machine }}
+        run: |
+          uv python install 3.12.13
+          python_path="$(uv python find --managed-python 3.12.13)"
+          if [[ ! -x "$python_path" ]]; then
+            echo "uv did not return an executable Python: $python_path" >&2
+            exit 1
+          fi
+          echo "PICK_LIST_BASE_PYTHON=$python_path" >> "$GITHUB_ENV"
+          "$python_path" - "$EXPECTED_MACHINE" <<'PY'
+          import platform
+          import sys
+
+          expected_machine = sys.argv[1]
+          actual_version = platform.python_version()
+          actual_machine = platform.machine()
+          print(f"Python executable: {sys.executable}")
+          print(f"Python version: {actual_version}")
+          print(f"Python architecture: {actual_machine}")
+          if actual_version != "3.12.13":
+              raise SystemExit(f"Expected Python 3.12.13, got {actual_version}")
+          if actual_machine != expected_machine:
+              raise SystemExit(
+                  f"Expected architecture {expected_machine}, got {actual_machine}"
+              )
+          PY
 
       - name: Verify lockfile
         run: uv lock --project backend --check
@@ -47,18 +70,78 @@ jobs:
       - name: Synchronize locked application and test dependencies
         run: >-
           uv sync --project backend --locked --no-default-groups
-          --extra desktop --group test --python 3.12.13
+          --extra desktop --group test --python "$PICK_LIST_BASE_PYTHON"
+
+      - name: Verify the synchronized application environment
+        env:
+          EXPECTED_MACHINE: ${{ matrix.expected_machine }}
+        run: |
+          app_python="$GITHUB_WORKSPACE/backend/.venv/bin/python"
+          if [[ ! -x "$app_python" ]]; then
+            echo "uv did not create the expected project interpreter: $app_python" >&2
+            exit 1
+          fi
+          echo "PICK_LIST_APP_PYTHON=$app_python" >> "$GITHUB_ENV"
+          echo "PICK_LIST_PACKAGER_PYTHON=$app_python" >> "$GITHUB_ENV"
+          "$app_python" - "$EXPECTED_MACHINE" <<'PY'
+          import platform
+          import sys
+
+          expected_machine = sys.argv[1]
+          print(f"Project interpreter: {sys.executable}")
+          print(f"Project Python version: {platform.python_version()}")
+          print(f"Project Python architecture: {platform.machine()}")
+          if platform.python_version() != "3.12.13":
+              raise SystemExit(
+                  f"Expected project Python 3.12.13, got {platform.python_version()}"
+              )
+          if platform.machine() != expected_machine:
+              raise SystemExit(
+                  f"Expected project architecture {expected_machine}, got {platform.machine()}"
+              )
+          PY
 
       - name: Install pinned PyInstaller build toolchain
         run: >-
-          uv pip install --python backend/.venv/bin/python --no-deps
+          uv pip install --python "$PICK_LIST_APP_PYTHON" --no-deps
           --requirements scripts/pyinstaller/requirements-macos.txt
+      - name: Verify pinned PyInstaller
+        run: |
+          "$PICK_LIST_APP_PYTHON" -c 'import PyInstaller, platform; print(f"PyInstaller {PyInstaller.__version__} via {platform.python_version()} ({platform.machine()})"); assert PyInstaller.__version__ == "6.22.3"'
+
+      - name: Verify locked uv run environment
+        env:
+          EXPECTED_MACHINE: ${{ matrix.expected_machine }}
+        run: |
+          uv run --project "$GITHUB_WORKSPACE/backend" --locked --no-sync \
+            --python "$PICK_LIST_BASE_PYTHON" python - \
+            "$GITHUB_WORKSPACE/backend/.venv" "$EXPECTED_MACHINE" <<'PY'
+          from pathlib import Path
+          import platform
+          import sys
+
+          expected_venv = Path(sys.argv[1]).resolve()
+          expected_machine = sys.argv[2]
+          print(f"uv run executable: {sys.executable}")
+          print(f"uv run environment: {Path(sys.prefix).resolve()}")
+          print(f"uv run Python: {platform.python_version()} ({platform.machine()})")
+          if Path(sys.prefix).resolve() != expected_venv:
+              raise SystemExit(f"uv run did not select the project environment: {expected_venv}")
+          if platform.python_version() != "3.12.13":
+              raise SystemExit(f"Expected Python 3.12.13, got {platform.python_version()}")
+          if platform.machine() != expected_machine:
+              raise SystemExit(
+                  f"Expected architecture {expected_machine}, got {platform.machine()}"
+              )
+          PY
 
       - name: Run test suite
         working-directory: backend
         env:
           QT_QPA_PLATFORM: offscreen
-        run: uv run --locked --no-sync --python 3.12.13 python -m pytest -q
+        run: >-
+          uv run --project "$GITHUB_WORKSPACE/backend" --locked --no-sync
+          --python "$PICK_LIST_BASE_PYTHON" python -m pytest -q
 
       - name: Build and validate standalone app
         run: ./scripts/build-pyinstaller-macos.sh "${{ matrix.arch }}"
