@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 from threading import Event
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal, Qt
-from PySide6.QtGui import QAction, QFont, QKeySequence, QPalette, QShortcut
+from PySide6.QtGui import QAction, QFont, QKeySequence, QPalette, QShortcut, QIcon, QPainter
+from PySide6.QtPdf import QPdfDocument
+from PySide6.QtPrintSupport import QPrintDialog, QPrinter, QPrinterInfo
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QFrame,
                                QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
                                QMessageBox, QPushButton, QComboBox, QTableWidget,
@@ -14,6 +17,12 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QFr
                                QSizePolicy)
 
 from app.desktop.application import PickListSession, ProcessedBatch, process_files
+
+
+def resource_path(relative_path: str) -> Path:
+    """Resolve a bundled desktop resource in source and frozen applications."""
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return bundle_root / relative_path
 
 
 class ProcessWorker(QObject):
@@ -33,10 +42,79 @@ class ProcessWorker(QObject):
             self.finished.emit(None, str(exc))
 
 
+class PrintPdfWorker(QObject):
+    finished = Signal(object, object, object)
+
+    def __init__(self, session: PickListSession, kind: str):
+        super().__init__()
+        self.session = session
+        self.kind = kind
+
+    def run(self):
+        temporary_directory = None
+        try:
+            temporary_directory = tempfile.TemporaryDirectory(prefix="pick-list-print-")
+            path = Path(temporary_directory.name) / f"{self.kind}.pdf"
+            self.session.export(path, self.kind)
+            self.finished.emit(str(path), None, temporary_directory)
+        except Exception as exc:
+            if temporary_directory is not None:
+                temporary_directory.cleanup()
+            self.finished.emit(None, str(exc), None)
+
+
+class PrintSendWorker(QObject):
+    finished = Signal(bool, object)
+
+    def __init__(self, path: Path, printer: QPrinter):
+        super().__init__()
+        self.path = path
+        self.printer = printer
+
+    def run(self) -> None:
+        document = QPdfDocument()
+        painter = QPainter()
+        painter_started = False
+        try:
+            load_error = document.load(str(self.path))
+            if load_error != QPdfDocument.Error.None_ or document.status() != QPdfDocument.Status.Ready:
+                raise RuntimeError(f"No se pudo cargar el PDF para imprimir (error {load_error}).")
+            page_rect = self.printer.pageRect(QPrinter.Unit.DevicePixel)
+            page_size = page_rect.size().toSize()
+            if document.pageCount() < 1 or page_size.isEmpty():
+                raise RuntimeError("El PDF no contiene páginas imprimibles.")
+            if not painter.begin(self.printer):
+                raise RuntimeError("No se pudo iniciar el trabajo de impresión.")
+            painter_started = True
+            for page_number in range(document.pageCount()):
+                if page_number and not self.printer.newPage():
+                    raise RuntimeError("La impresora no pudo preparar la página siguiente.")
+                image = document.render(page_number, page_size)
+                if image.isNull():
+                    raise RuntimeError(f"No se pudo renderizar la página {page_number + 1} del PDF.")
+                painter.drawImage(page_rect, image)
+            if not painter.end():
+                painter_started = False
+                raise RuntimeError("No se pudo finalizar el trabajo de impresión.")
+            painter_started = False
+            if self.printer.printerState() in (QPrinter.PrinterState.Error, QPrinter.PrinterState.Aborted):
+                raise RuntimeError("El sistema no aceptó el trabajo de impresión.")
+        except Exception as exc:
+            if painter_started:
+                self.printer.abort()
+                painter.end()
+            self.finished.emit(False, str(exc))
+        else:
+            self.finished.emit(True, None)
+        finally:
+            document.close()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Pick List")
+        self.setWindowIcon(QIcon(str(resource_path("assets/icons/pick_list.png"))))
         self.resize(1050, 720)
         self.setMinimumSize(760, 550)
         self._control_height = 34
@@ -48,6 +126,16 @@ class MainWindow(QMainWindow):
         self._worker_thread: QThread | None = None
         self._worker: ProcessWorker | None = None
         self._cancel_event: Event | None = None
+        self._printing = False
+        self._print_result_received = False
+        self._print_thread_finished = False
+        self._print_thread: QThread | None = None
+        self._print_worker: PrintPdfWorker | None = None
+        self._print_temp_dir: tempfile.TemporaryDirectory | None = None
+        self._print_send_thread: QThread | None = None
+        self._print_send_worker: PrintSendWorker | None = None
+        self._print_send_done = True
+        self._print_send_thread_finished = True
         self._metric_card_layout: QGridLayout | None = None
         self._metric_cards: list[QFrame] = []
         self._metric_values: dict[str, QLabel] = {}
@@ -262,6 +350,7 @@ class MainWindow(QMainWindow):
         exports_layout.addWidget(exports_heading)
         exports = QHBoxLayout()
         self.export_buttons: list[QPushButton] = []
+        self.print_buttons: list[QPushButton] = []
         for label, kind, default, description in (
             ("Lista Pickeo Bodega", "bodega", "Lista Pickeo Bodega.pdf",
              "Productos CAJA y resumen de facturas."),
@@ -280,9 +369,21 @@ class MainWindow(QMainWindow):
             button.setAccessibleDescription("Genera y guarda el PDF correspondiente.")
             export_handler = self._export_bodega_clicked if kind == "bodega" else self._export_local_clicked
             button.clicked.connect(export_handler)
-            export_group.addWidget(button)
+            print_button = QPushButton(f"Imprimir {label.rsplit(' ', 1)[-1]}")
+            print_button.setObjectName("print_action")
+            print_button.setMinimumHeight(self._control_height)
+            print_button.setAccessibleName(f"Imprimir {label.rsplit(' ', 1)[-1]}")
+            print_button.setAccessibleDescription("Abre el diálogo del sistema para seleccionar opciones e impresora.")
+            print_handler = self._print_bodega_clicked if kind == "bodega" else self._print_local_clicked
+            print_button.clicked.connect(print_handler)
+            action_row = QHBoxLayout()
+            action_row.setSpacing(6)
+            action_row.addWidget(button, 1)
+            action_row.addWidget(print_button, 1)
+            export_group.addLayout(action_row)
             exports.addLayout(export_group, 1)
             self.export_buttons.append(button)
+            self.print_buttons.append(print_button)
         exports_layout.addLayout(exports)
         layout.addWidget(self.exports_panel)
         self.setCentralWidget(root)
@@ -307,7 +408,9 @@ class MainWindow(QMainWindow):
         QWidget.setTabOrder(self.products, self.sources)
         QWidget.setTabOrder(self.sources, self.export_buttons[0])
         QWidget.setTabOrder(self.export_buttons[0], self.export_buttons[1])
-        QWidget.setTabOrder(self.export_buttons[1], self.reset_button)
+        QWidget.setTabOrder(self.export_buttons[1], self.print_buttons[0])
+        QWidget.setTabOrder(self.print_buttons[0], self.print_buttons[1])
+        QWidget.setTabOrder(self.print_buttons[1], self.reset_button)
         self._set_metric_columns(5)
         self.refresh_all()
 
@@ -407,8 +510,16 @@ class MainWindow(QMainWindow):
         self._processing = active
         self.add_button.setEnabled(not active)
         self.reset_button.setEnabled(not active)
-        for button in self.export_buttons:
-            button.setEnabled(not active)
+        self._update_action_buttons()
+
+    def _update_action_buttons(self) -> None:
+        products = self.session.consolidated()
+        can_bodega = any(product.presentation == "caja" for product in products)
+        can_local = any(product.presentation in {"unitario", "pack"} for product in products)
+        enabled = not self._processing and not self._printing
+        for index, has_exportable_products in enumerate((can_bodega, can_local)):
+            self.export_buttons[index].setEnabled(enabled)
+            self.print_buttons[index].setEnabled(enabled and has_exportable_products)
 
     def request_cancel(self) -> None:
         """Ask the worker to stop before it starts another document."""
@@ -437,6 +548,7 @@ class MainWindow(QMainWindow):
         }
         for key, value in values.items():
             self._metric_values[key].setText(str(value))
+        self._update_action_buttons()
         self.sources.setRowCount(len(self.session.sources))
         self.source_detail.clear()
         self.source_detail_label.hide()
@@ -528,6 +640,107 @@ class MainWindow(QMainWindow):
     def _export_local_clicked(self, _checked: bool = False) -> None:
         self.export_pdf("local", "Lista Pickeo Local.pdf")
 
+    def _print_bodega_clicked(self, _checked: bool = False) -> None:
+        self.print_pdf("bodega")
+
+    def _print_local_clicked(self, _checked: bool = False) -> None:
+        self.print_pdf("local")
+
+    def print_pdf(self, kind: str) -> None:
+        if self._processing or self._printing:
+            return
+        if not QPrinterInfo.availablePrinters():
+            QMessageBox.warning(self, "Sin impresoras", "No hay impresoras disponibles en el sistema.")
+            return
+
+        self._printing = True
+        self._print_result_received = False
+        self._print_thread_finished = False
+        self._print_send_done = True
+        self._print_send_thread_finished = True
+        self._update_action_buttons()
+        self._print_thread = QThread(self)
+        self._print_worker = PrintPdfWorker(self.session, kind)
+        self._print_worker.moveToThread(self._print_thread)
+        self._print_thread.started.connect(self._print_worker.run)
+        self._print_worker.finished.connect(self._on_print_pdf_ready)
+        self._print_worker.finished.connect(self._print_thread.quit)
+        self._print_worker.finished.connect(self._print_worker.deleteLater)
+        self._print_thread.finished.connect(self._on_print_thread_finished)
+        self._print_thread.finished.connect(self._print_thread.deleteLater)
+        self._print_thread.start()
+
+    def _on_print_pdf_ready(self, path: str | None, error: str | None,
+                            temporary_directory: tempfile.TemporaryDirectory | None) -> None:
+        self._print_result_received = True
+        self._print_temp_dir = temporary_directory
+        if error:
+            QMessageBox.critical(self, "Error al generar el PDF", error)
+        elif self._closing:
+            pass
+        else:
+            try:
+                self._show_print_dialog_and_send(Path(path))
+            except Exception as exc:
+                QMessageBox.critical(self, "Error de impresión", str(exc))
+        self._finish_print_flow_if_ready()
+
+    def _show_print_dialog_and_send(self, path: Path) -> None:
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        dialog = QPrintDialog(printer, self)
+        if dialog.exec() != QPrintDialog.DialogCode.Accepted:
+            return
+        if not printer.isValid():
+            QMessageBox.critical(self, "Error de impresión", "La impresora seleccionada no es válida.")
+            return
+        self._print_send_done = False
+        self._print_send_thread_finished = False
+        self._print_send_thread = QThread(self)
+        self._print_send_worker = PrintSendWorker(path, printer)
+        self._print_send_worker.moveToThread(self._print_send_thread)
+        printer.moveToThread(self._print_send_thread)
+        self._print_send_thread.started.connect(self._print_send_worker.run)
+        self._print_send_worker.finished.connect(self._on_print_sent)
+        self._print_send_worker.finished.connect(self._print_send_thread.quit)
+        self._print_send_worker.finished.connect(self._print_send_worker.deleteLater)
+        self._print_send_worker.finished.connect(printer.deleteLater)
+        self._print_send_thread.finished.connect(self._on_print_send_thread_finished)
+        self._print_send_thread.finished.connect(self._print_send_thread.deleteLater)
+        self._print_send_thread.start()
+
+    def _on_print_sent(self, accepted: bool, error: str | None) -> None:
+        self._print_send_done = True
+        if accepted:
+            QMessageBox.information(self, "Impresión enviada", "El trabajo se envió a la cola de impresión.")
+        elif error:
+            QMessageBox.critical(self, "Error de impresión", error)
+        self._finish_print_flow_if_ready()
+
+    def _on_print_send_thread_finished(self) -> None:
+        self._print_send_thread_finished = True
+        self._finish_print_flow_if_ready()
+
+    def _on_print_thread_finished(self) -> None:
+        self._print_thread_finished = True
+        self._finish_print_flow_if_ready()
+
+    def _finish_print_flow_if_ready(self) -> None:
+        if not (self._print_result_received and self._print_thread_finished
+                and self._print_send_done and self._print_send_thread_finished):
+            return
+        self._print_thread = None
+        self._print_worker = None
+        self._print_send_thread = None
+        self._print_send_worker = None
+        if self._print_temp_dir is not None:
+            self._print_temp_dir.cleanup()
+            self._print_temp_dir = None
+        self._printing = False
+        if not self._closing:
+            self._update_action_buttons()
+        else:
+            self.close()
+
     def reset_session(self):
         if self._processing:
             return
@@ -537,6 +750,11 @@ class MainWindow(QMainWindow):
             self.refresh_all()
 
     def closeEvent(self, event):
+        if self._printing:
+            self._closing = True
+            self.setEnabled(False)
+            event.ignore()
+            return
         if self._worker_thread is not None and not self._thread_finished:
             self._closing = True
             self.setEnabled(False)
@@ -550,6 +768,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Pick List")
+    app.setWindowIcon(QIcon(str(resource_path("assets/icons/pick_list.png"))))
     window = MainWindow()
     window.show()
     return app.exec()
