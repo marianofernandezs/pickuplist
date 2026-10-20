@@ -3,16 +3,149 @@ from __future__ import annotations
 from pathlib import Path
 
 import fitz
+import logging
+import re
+from threading import get_ident
+import pytest
 from PIL import Image
-from PySide6.QtCore import QRectF
-from PySide6.QtGui import QImage
+from PySide6.QtCore import QEventLoop, QRectF, QThread
+from PySide6.QtGui import QImage, QPageLayout, QPageRanges
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtPrintSupport import QPrintDialog
+from PySide6.QtWidgets import QApplication
 
 from app.desktop.application import LocalSource, PickListSession, SessionProduct
 from app.desktop import main as desktop_main
-from app.desktop.main import MainWindow, PrintPdfWorker, PrintSendWorker
+from app.desktop.main import MainWindow, PrinterSettings, PrintPdfWorker, PrintSendWorker
 from app.services.document_summary import DocumentSummary
+
+
+REAL_QPRINTER = desktop_main.QPrinter
+
+
+def _printer_settings() -> PrinterSettings:
+    return PrinterSettings(
+        printer_name="Mock Printer",
+        page_layout=QPageLayout(),
+        resolution=72,
+        color_mode=REAL_QPRINTER.ColorMode.Color,
+        duplex=REAL_QPRINTER.DuplexMode.DuplexNone,
+        copy_count=1,
+        collate_copies=False,
+        page_order=REAL_QPRINTER.PageOrder.FirstPageFirst,
+        print_range=REAL_QPRINTER.PrintRange.AllPages,
+        from_page=0,
+        to_page=0,
+        page_ranges=QPageRanges(),
+        paper_source=REAL_QPRINTER.PaperSource.Auto,
+        full_page=False,
+        output_format=REAL_QPRINTER.OutputFormat.NativeFormat,
+        output_file_name="",
+        font_embedding_enabled=True,
+    )
+
+
+class MockPrinter:
+    PrinterMode = REAL_QPRINTER.PrinterMode
+    Unit = REAL_QPRINTER.Unit
+    PrinterState = REAL_QPRINTER.PrinterState
+    PrintRange = REAL_QPRINTER.PrintRange
+
+    def __init__(self, *_args):
+        self.created_on_main_thread = QThread.currentThread() == QApplication.instance().thread()
+        self.printer_name = "Mock Printer"
+
+    def __getattr__(self, name):
+        if name == "moveToThread":
+            raise AttributeError("'PySide6.QtPrintSupport.QPrinter' object has no attribute 'moveToThread'")
+        if name.startswith("set"):
+            return lambda *_args: None
+        raise AttributeError(name)
+
+    def isValid(self):
+        return True
+
+    def printerName(self):
+        return self.printer_name
+
+    def pageLayout(self):
+        return QPageLayout()
+
+    def resolution(self):
+        return 72
+
+    def colorMode(self):
+        return REAL_QPRINTER.ColorMode.Color
+
+    def duplex(self):
+        return REAL_QPRINTER.DuplexMode.DuplexNone
+
+    def copyCount(self):
+        return 1
+
+    def collateCopies(self):
+        return False
+
+    def pageOrder(self):
+        return REAL_QPRINTER.PageOrder.FirstPageFirst
+
+    def printRange(self):
+        return REAL_QPRINTER.PrintRange.AllPages
+
+    def fromPage(self):
+        return 0
+
+    def toPage(self):
+        return 0
+
+    def pageRanges(self):
+        return QPageRanges()
+
+    def paperSource(self):
+        return REAL_QPRINTER.PaperSource.Auto
+
+    def fullPage(self):
+        return False
+
+    def outputFormat(self):
+        return REAL_QPRINTER.OutputFormat.NativeFormat
+
+    def outputFileName(self):
+        return ""
+
+    def fontEmbeddingEnabled(self):
+        return True
+
+    def pageRect(self, *_args):
+        return QRectF(0, 0, 500, 700)
+
+    def newPage(self):
+        return True
+
+    def printerState(self):
+        return self.PrinterState.Idle
+
+    def abort(self):
+        pass
+
+
+class MockPrintDialog:
+    DialogCode = QPrintDialog.DialogCode
+    result = QPrintDialog.DialogCode.Accepted
+    instances = []
+
+    def __init__(self, printer, *_args):
+        self.printer_id = id(printer)
+        self.instances.append(self)
+
+    def exec(self):
+        return self.result
+
+    def close(self):
+        pass
+
+    def deleteLater(self):
+        pass
 
 
 def _session() -> PickListSession:
@@ -60,35 +193,287 @@ def test_print_pdf_generation_matches_export_for_bodega_and_local(tmp_path) -> N
         assert not print_path.exists()
 
 
-def test_cancelled_print_dialog_does_not_send_or_report_success(qtbot, monkeypatch, tmp_path) -> None:
+def test_cancelled_print_dialog_does_not_send_or_report_success(qtbot, monkeypatch) -> None:
     window = MainWindow()
     qtbot.addWidget(window)
-    pdf = tmp_path / "print.pdf"
-    _session().export(pdf, "local")
+    MockPrintDialog.instances = []
+    monkeypatch.setattr(MockPrintDialog, "result", QPrintDialog.DialogCode.Rejected)
+    monkeypatch.setattr(desktop_main, "QPrinter", MockPrinter)
+    monkeypatch.setattr(desktop_main, "QPrintDialog", MockPrintDialog)
+    monkeypatch.setattr(desktop_main.QPrinterInfo, "availablePrinters", lambda: [object()])
+    temporary_directories = []
+    real_temp_directory = desktop_main.tempfile.TemporaryDirectory
+
+    def tracked_temp_directory(*args, **kwargs):
+        temporary = real_temp_directory(*args, **kwargs)
+        temporary_directories.append(temporary)
+        return temporary
+
+    monkeypatch.setattr(desktop_main.tempfile, "TemporaryDirectory", tracked_temp_directory)
     messages = []
-
-    class Printer:
-        PrinterMode = desktop_main.QPrinter.PrinterMode
-
-        def __init__(self, *_args):
-            pass
-
-    class Dialog:
-        DialogCode = QPrintDialog.DialogCode
-
-        def __init__(self, *_args):
-            pass
-
-        def exec(self):
-            return QPrintDialog.DialogCode.Rejected
-
-    monkeypatch.setattr(desktop_main, "QPrinter", Printer)
-    monkeypatch.setattr(desktop_main, "QPrintDialog", Dialog)
     monkeypatch.setattr(desktop_main.QMessageBox, "information", lambda *args: messages.append(args))
-    window._show_print_dialog_and_send(pdf)
+    window.print_pdf("local")
+    qtbot.waitUntil(lambda: not window._printing, timeout=5000)
 
     assert messages == []
+    assert len(MockPrintDialog.instances) == 1
+    assert window._print_send_worker is None
+    assert temporary_directories and not Path(temporary_directories[0].name).exists()
     window.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "button_index", "expected_text"),
+    [
+        ("bodega", 0, "BOLSA"),
+        ("local", 1, "VASO"),
+    ],
+)
+def test_print_button_runs_full_threaded_flow_without_moving_printer(
+    qtbot, monkeypatch, kind, button_index, expected_text
+) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.session = _session()
+    window.refresh_all()
+    MockPrintDialog.instances = []
+    monkeypatch.setattr(MockPrintDialog, "result", QPrintDialog.DialogCode.Accepted)
+
+    created_printers = []
+    printer_destroyed_on_main = []
+
+    class TrackingPrinter(MockPrinter):
+        def __init__(self, *args):
+            super().__init__(*args)
+            created_printers.append((self.created_on_main_thread, id(self)))
+
+        def __del__(self):
+            printer_destroyed_on_main.append(
+                QThread.currentThread() == QApplication.instance().thread()
+            )
+
+    loaded_pdfs = []
+    document_thread_states = []
+    painter_thread_states = []
+
+    class Document:
+        Error = QPdfDocument.Error
+        Status = QPdfDocument.Status
+
+        def __init__(self):
+            document_thread_states.append(
+                QThread.currentThread() == QApplication.instance().thread()
+            )
+
+        def load(self, path):
+            loaded_pdfs.append(_pdf_text(Path(path)))
+            return QPdfDocument.Error.None_
+
+        def status(self):
+            return QPdfDocument.Status.Ready
+
+        def pageCount(self):
+            return 1
+
+        def render(self, *_args):
+            return QImage(16, 16, QImage.Format.Format_RGB32)
+
+        def close(self):
+            document_thread_states.append(
+                QThread.currentThread() == QApplication.instance().thread()
+            )
+
+    class Painter:
+        def __init__(self):
+            painter_thread_states.append(
+                QThread.currentThread() == QApplication.instance().thread()
+            )
+
+        def begin(self, *_args):
+            return True
+
+        def drawImage(self, *_args):
+            pass
+
+        def end(self):
+            return True
+
+    temp_directories = []
+    real_temp_directory = desktop_main.tempfile.TemporaryDirectory
+
+    def tracked_temp_directory(*args, **kwargs):
+        temporary = real_temp_directory(*args, **kwargs)
+        temp_directories.append(temporary)
+        return temporary
+
+    success_messages = []
+    critical_messages = []
+    monkeypatch.setattr(desktop_main.tempfile, "TemporaryDirectory", tracked_temp_directory)
+    monkeypatch.setattr(desktop_main, "QPrinter", TrackingPrinter)
+    monkeypatch.setattr(desktop_main, "QPrintDialog", MockPrintDialog)
+    monkeypatch.setattr(desktop_main, "QPdfDocument", Document)
+    monkeypatch.setattr(desktop_main, "QPainter", Painter)
+    monkeypatch.setattr(desktop_main.QPrinterInfo, "availablePrinters", lambda: [object()])
+    monkeypatch.setattr(
+        desktop_main.QMessageBox,
+        "information",
+        lambda *args: success_messages.append(args),
+    )
+    monkeypatch.setattr(
+        desktop_main.QMessageBox,
+        "critical",
+        lambda *args: critical_messages.append(args),
+    )
+
+    window.print_buttons[button_index].click()
+    qtbot.waitUntil(lambda: not window._printing, timeout=5000)
+
+    assert not hasattr(REAL_QPRINTER(), "moveToThread")
+    assert not critical_messages
+    assert len(success_messages) == 1
+    assert len(MockPrintDialog.instances) == 1
+    assert MockPrintDialog.instances[0].printer_id == created_printers[0][1]
+    assert [created_on_main for created_on_main, _identity in created_printers] == [True, False]
+    assert loaded_pdfs and expected_text in loaded_pdfs[0]
+    assert document_thread_states == [False, False]
+    assert painter_thread_states == [False]
+    assert printer_destroyed_on_main == [True, False]
+    assert window._print_thread is None
+    assert window._print_send_thread is None
+    assert window._print_worker is None
+    assert window._print_send_worker is None
+    assert window._print_thread_finished
+    assert window._print_send_thread_finished
+    assert temp_directories and not Path(temp_directories[0].name).exists()
+    window.close()
+
+
+@pytest.mark.parametrize(
+    ("button_index", "kind", "expected_text"),
+    [(0, "bodega", "BOLSA"), (1, "local", "VASO")],
+)
+def test_print_button_loads_real_exported_pdf_in_send_worker_and_cleans_temp(
+    qtbot, monkeypatch, caplog, button_index, kind, expected_text
+) -> None:
+    """Exercise actual ReportLab export and QPdfDocument.load in the worker thread."""
+    caplog.set_level(logging.DEBUG, logger=desktop_main.__name__)
+    main_thread_id = get_ident()
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.session = _session()
+    window.refresh_all()
+    MockPrintDialog.instances = []
+    monkeypatch.setattr(MockPrintDialog, "result", QPrintDialog.DialogCode.Accepted)
+
+    class InterleavingPrintDialog(MockPrintDialog):
+        def __init__(self, printer, parent):
+            super().__init__(printer, parent)
+            self.owner = parent
+            self.pdf_exists_after_export_thread_finished = None
+
+        def exec(self):
+            # QPrintDialog.exec() runs a nested event loop. Wait for the export
+            # QThread's finished signal inside that loop, before accepting the
+            # dialog, to reproduce the observed signal interleaving.
+            export_thread = self.owner._print_thread
+            loop = QEventLoop()
+            export_thread.finished.connect(loop.quit)
+            if not export_thread.isFinished():
+                loop.exec()
+            QApplication.processEvents()
+            self.export_finished_callback_ran_in_dialog = self.owner._print_thread_finished
+            temporary_directory = self.owner._print_temp_dir
+            self.pdf_exists_after_export_thread_finished = bool(
+                temporary_directory
+                and (Path(temporary_directory.name) / f"{kind}.pdf").is_file()
+            )
+            return self.result
+
+    class TrackingPrinter(MockPrinter):
+        def pageRect(self, *_args):
+            return QRectF(0, 0, 500, 700)
+
+    class Painter:
+        def begin(self, *_args):
+            return True
+
+        def drawImage(self, *_args):
+            pass
+
+        def end(self):
+            return True
+
+    temp_dirs = []
+    real_temp_dir = desktop_main.tempfile.TemporaryDirectory
+
+    def tracked_temp_dir(*args, **kwargs):
+        temp = real_temp_dir(*args, **kwargs)
+        temp_dirs.append(temp)
+        return temp
+
+    critical = []
+    sent = []
+    monkeypatch.setattr(desktop_main.tempfile, "TemporaryDirectory", tracked_temp_dir)
+    monkeypatch.setattr(desktop_main, "QPrinter", TrackingPrinter)
+    monkeypatch.setattr(desktop_main, "QPrintDialog", InterleavingPrintDialog)
+    monkeypatch.setattr(desktop_main, "QPainter", Painter)
+    monkeypatch.setattr(desktop_main.QPrinterInfo, "availablePrinters", lambda: [object()])
+    monkeypatch.setattr(desktop_main.QMessageBox, "critical", lambda *args: critical.append(args))
+    monkeypatch.setattr(desktop_main.QMessageBox, "information", lambda *args: sent.append(args))
+
+    window.print_buttons[button_index].click()
+    qtbot.waitUntil(lambda: not window._printing, timeout=5000)
+
+    assert not critical
+    assert len(sent) == 1
+    assert temp_dirs
+    assert not Path(temp_dirs[0].name).exists()
+    assert window._print_temp_dir is None
+    assert window._print_worker is None
+    assert window._print_send_worker is None
+    assert window._print_thread is None
+    assert window._print_send_thread is None
+    dialog = InterleavingPrintDialog.instances[0]
+    assert dialog.export_finished_callback_ran_in_dialog is True
+    assert dialog.pdf_exists_after_export_thread_finished is True
+    assert f"Print PDF after export completed: path=" in caplog.text
+    assert "exists=true size_bytes=" in caplog.text
+    assert "Print PDF immediately before QPdfDocument.load: path=" in caplog.text
+    assert "QPdfDocument loaded print PDF:" in caplog.text
+    assert "Removed print temporary directory:" in caplog.text
+    assert "exists=False" in caplog.text
+    export_log = re.search(
+        r"Print PDF after export completed: path=(\S+) exists=true size_bytes=(\d+) thread_id=(\d+)",
+        caplog.text,
+    )
+    load_log = re.search(
+        r"Print PDF immediately before QPdfDocument.load: path=(\S+) exists=true size_bytes=(\d+) thread_id=(\d+)",
+        caplog.text,
+    )
+    loaded_log = re.search(
+        r"QPdfDocument loaded print PDF: path=(\S+) page_count=(\d+) thread_id=(\d+)",
+        caplog.text,
+    )
+    assert export_log and load_log and loaded_log
+    assert Path(export_log.group(1)).is_absolute()
+    assert export_log.group(1) == load_log.group(1) == loaded_log.group(1)
+    assert int(export_log.group(2)) > 0
+    assert export_log.group(2) == load_log.group(2)
+    assert int(loaded_log.group(2)) > 0
+    assert int(load_log.group(3)) != main_thread_id
+    # The real QPdfDocument load and render must succeed for the mocked printer
+    # to receive a successful completion from this production worker flow.
+    assert expected_text in _pdf_text_from_log_free_export(window.session, kind)
+    window.close()
+
+
+def _pdf_text_from_log_free_export(session: PickListSession, kind: str) -> str:
+    """Read expected business content from the unchanged exporter, outside logs."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="pick-list-test-expected-") as directory:
+        path = session.export(Path(directory) / f"{kind}.pdf", kind)
+        return _pdf_text(path)
 
 
 def test_invalid_pdf_does_not_report_print_success(qtbot, monkeypatch, tmp_path) -> None:
@@ -99,33 +484,12 @@ def test_invalid_pdf_does_not_report_print_success(qtbot, monkeypatch, tmp_path)
     critical = []
     information = []
 
-    class Printer:
-        PrinterMode = desktop_main.QPrinter.PrinterMode
-        Unit = desktop_main.QPrinter.Unit
-        PrinterState = desktop_main.QPrinter.PrinterState
-
-        def __init__(self, *_args):
-            pass
-
-        def isValid(self):
-            return True
-
-    class Dialog:
-        DialogCode = QPrintDialog.DialogCode
-
-        def __init__(self, *_args):
-            pass
-
-        def exec(self):
-            return QPrintDialog.DialogCode.Accepted
-
-    monkeypatch.setattr(desktop_main, "QPrinter", Printer)
-    monkeypatch.setattr(desktop_main, "QPrintDialog", Dialog)
+    monkeypatch.setattr(desktop_main, "QPrinter", MockPrinter)
     monkeypatch.setattr(desktop_main.QMessageBox, "critical", lambda *args: critical.append(args))
     monkeypatch.setattr(desktop_main.QMessageBox, "information", lambda *args: information.append(args))
 
     result = []
-    worker = PrintSendWorker(invalid_pdf, object())
+    worker = PrintSendWorker(invalid_pdf, _printer_settings())
     worker.finished.connect(lambda *values: result.append(values))
     worker.run()
     window._on_print_sent(*result[0])
@@ -144,37 +508,9 @@ def test_render_failure_aborts_job_and_does_not_report_success(qtbot, monkeypatc
     information = []
     printer_aborted = []
 
-    class Printer:
-        PrinterMode = desktop_main.QPrinter.PrinterMode
-        Unit = desktop_main.QPrinter.Unit
-        PrinterState = desktop_main.QPrinter.PrinterState
-
-        def __init__(self, *_args):
-            pass
-
-        def isValid(self):
-            return True
-
-        def pageRect(self, *_args):
-            return QRectF(0, 0, 500, 700)
-
-        def newPage(self):
-            return True
-
-        def printerState(self):
-            return self.PrinterState.Idle
-
+    class RenderFailurePrinter(MockPrinter):
         def abort(self):
             printer_aborted.append(True)
-
-    class Dialog:
-        DialogCode = QPrintDialog.DialogCode
-
-        def __init__(self, *_args):
-            pass
-
-        def exec(self):
-            return QPrintDialog.DialogCode.Accepted
 
     class Document:
         Error = QPdfDocument.Error
@@ -209,14 +545,13 @@ def test_render_failure_aborts_job_and_does_not_report_success(qtbot, monkeypatc
         def end(self):
             return True
 
-    monkeypatch.setattr(desktop_main, "QPrinter", Printer)
-    monkeypatch.setattr(desktop_main, "QPrintDialog", Dialog)
+    monkeypatch.setattr(desktop_main, "QPrinter", RenderFailurePrinter)
     monkeypatch.setattr(desktop_main, "QPdfDocument", Document)
     monkeypatch.setattr(desktop_main, "QPainter", Painter)
     monkeypatch.setattr(desktop_main.QMessageBox, "critical", lambda *args: critical.append(args))
     monkeypatch.setattr(desktop_main.QMessageBox, "information", lambda *args: information.append(args))
     result = []
-    worker = PrintSendWorker(pdf, Printer())
+    worker = PrintSendWorker(pdf, _printer_settings())
     worker.finished.connect(lambda *values: result.append(values))
     worker.run()
     window._on_print_sent(*result[0])
@@ -227,22 +562,13 @@ def test_render_failure_aborts_job_and_does_not_report_success(qtbot, monkeypatc
     window.close()
 
 
-def test_printer_rejection_does_not_report_success(monkeypatch, tmp_path) -> None:
+def test_printer_rejection_does_not_report_success(qtbot, monkeypatch, tmp_path) -> None:
     pdf = tmp_path / "valid.pdf"
     _session().export(pdf, "local")
 
-    class Printer:
-        Unit = desktop_main.QPrinter.Unit
-        PrinterState = desktop_main.QPrinter.PrinterState
-
-        def pageRect(self, *_args):
-            return QRectF(0, 0, 500, 700)
-
+    class ErrorPrinter(MockPrinter):
         def printerState(self):
             return self.PrinterState.Error
-
-        def abort(self):
-            pass
 
     class Document:
         Error = QPdfDocument.Error
@@ -273,10 +599,11 @@ def test_printer_rejection_does_not_report_success(monkeypatch, tmp_path) -> Non
         def end(self):
             return True
 
+    monkeypatch.setattr(desktop_main, "QPrinter", ErrorPrinter)
     monkeypatch.setattr(desktop_main, "QPdfDocument", Document)
     monkeypatch.setattr(desktop_main, "QPainter", Painter)
     results = []
-    worker = PrintSendWorker(pdf, Printer())
+    worker = PrintSendWorker(pdf, _printer_settings())
     worker.finished.connect(lambda *values: results.append(values))
 
     worker.run()

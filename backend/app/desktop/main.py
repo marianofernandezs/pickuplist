@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import sys
 import tempfile
-from threading import Event
+import logging
+from dataclasses import dataclass
 from pathlib import Path
+from threading import Event, get_ident
 
 from PySide6.QtCore import QObject, QThread, Signal, Qt
-from PySide6.QtGui import QAction, QFont, QKeySequence, QPalette, QShortcut, QIcon, QPainter
+from PySide6.QtGui import (QAction, QFont, QKeySequence, QPalette, QShortcut, QIcon,
+                           QPainter, QPageLayout, QPageRanges)
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter, QPrinterInfo
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QFrame,
@@ -17,6 +20,46 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QFr
                                QSizePolicy)
 
 from app.desktop.application import PickListSession, ProcessedBatch, process_files
+
+
+logger = logging.getLogger(__name__)
+
+
+def _log_print_pdf_state(stage: str, path: Path) -> None:
+    """Log print-PDF metadata without exposing document contents."""
+    try:
+        absolute_path = path.resolve(strict=False)
+        stat = absolute_path.stat()
+        logger.debug(
+            "Print PDF %s: path=%s exists=true size_bytes=%d thread_id=%s",
+            stage,
+            absolute_path,
+            stat.st_size,
+            get_ident(),
+        )
+    except OSError:
+        logger.debug(
+            "Print PDF %s: path=%s exists=false size_bytes=0 thread_id=%s",
+            stage,
+            path.resolve(strict=False),
+            get_ident(),
+        )
+
+
+def _cleanup_print_temp_directory(directory: tempfile.TemporaryDirectory) -> None:
+    path = Path(directory.name)
+    logger.debug(
+        "Removing print temporary directory: path=%s thread_id=%s",
+        path.resolve(strict=False),
+        get_ident(),
+    )
+    directory.cleanup()
+    logger.debug(
+        "Removed print temporary directory: path=%s exists=%s thread_id=%s",
+        path.resolve(strict=False),
+        path.exists(),
+        get_ident(),
+    )
 
 
 def resource_path(relative_path: str) -> Path:
@@ -55,39 +98,130 @@ class PrintPdfWorker(QObject):
         try:
             temporary_directory = tempfile.TemporaryDirectory(prefix="pick-list-print-")
             path = Path(temporary_directory.name) / f"{self.kind}.pdf"
-            self.session.export(path, self.kind)
+            logger.debug(
+                "Print PDF export starting: path=%s thread_id=%s",
+                path.resolve(strict=False),
+                get_ident(),
+            )
+            exported_path = self.session.export(path, self.kind)
+            path = Path(exported_path).resolve(strict=True)
+            _log_print_pdf_state("after export completed", path)
             self.finished.emit(str(path), None, temporary_directory)
         except Exception as exc:
             if temporary_directory is not None:
-                temporary_directory.cleanup()
+                _cleanup_print_temp_directory(temporary_directory)
             self.finished.emit(None, str(exc), None)
+
+
+@dataclass(frozen=True)
+class PrinterSettings:
+    """Copy dialog choices as value data; never pass QPrinter across threads."""
+
+    printer_name: str
+    page_layout: QPageLayout
+    resolution: int
+    color_mode: QPrinter.ColorMode
+    duplex: QPrinter.DuplexMode
+    copy_count: int
+    collate_copies: bool
+    page_order: QPrinter.PageOrder
+    print_range: QPrinter.PrintRange
+    from_page: int
+    to_page: int
+    page_ranges: QPageRanges
+    paper_source: QPrinter.PaperSource
+    full_page: bool
+    output_format: QPrinter.OutputFormat
+    output_file_name: str
+    font_embedding_enabled: bool
+
+    @classmethod
+    def from_printer(cls, printer: QPrinter) -> "PrinterSettings":
+        return cls(
+            printer_name=printer.printerName(),
+            page_layout=QPageLayout(printer.pageLayout()),
+            resolution=printer.resolution(),
+            color_mode=printer.colorMode(),
+            duplex=printer.duplex(),
+            copy_count=printer.copyCount(),
+            collate_copies=printer.collateCopies(),
+            page_order=printer.pageOrder(),
+            print_range=printer.printRange(),
+            from_page=printer.fromPage(),
+            to_page=printer.toPage(),
+            page_ranges=QPageRanges(printer.pageRanges()),
+            paper_source=printer.paperSource(),
+            full_page=printer.fullPage(),
+            output_format=printer.outputFormat(),
+            output_file_name=printer.outputFileName(),
+            font_embedding_enabled=printer.fontEmbeddingEnabled(),
+        )
+
+    def apply_to(self, printer: QPrinter) -> None:
+        if self.printer_name:
+            printer.setPrinterName(self.printer_name)
+        printer.setPageLayout(self.page_layout)
+        printer.setResolution(self.resolution)
+        printer.setColorMode(self.color_mode)
+        printer.setDuplex(self.duplex)
+        printer.setCopyCount(self.copy_count)
+        printer.setCollateCopies(self.collate_copies)
+        printer.setPageOrder(self.page_order)
+        printer.setPrintRange(self.print_range)
+        printer.setFromTo(self.from_page, self.to_page)
+        printer.setPageRanges(self.page_ranges)
+        printer.setPaperSource(self.paper_source)
+        printer.setFullPage(self.full_page)
+        printer.setOutputFormat(self.output_format)
+        printer.setOutputFileName(self.output_file_name)
+        printer.setFontEmbeddingEnabled(self.font_embedding_enabled)
 
 
 class PrintSendWorker(QObject):
     finished = Signal(bool, object)
 
-    def __init__(self, path: Path, printer: QPrinter):
+    def __init__(self, path: Path, settings: PrinterSettings):
         super().__init__()
         self.path = path
-        self.printer = printer
+        self.settings = settings
 
     def run(self) -> None:
-        document = QPdfDocument()
-        painter = QPainter()
+        document = None
+        printer = None
+        painter = None
         painter_started = False
+        error = None
+        accepted = False
         try:
-            load_error = document.load(str(self.path))
+            # These Qt paint/PDF objects are created and destroyed in this worker
+            # thread. Only immutable/value settings cross from the UI thread.
+            document = QPdfDocument()
+            printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+            painter = QPainter()
+            self.settings.apply_to(printer)
+            if not printer.isValid():
+                raise RuntimeError("La impresora seleccionada ya no está disponible.")
+            absolute_path = self.path.resolve(strict=False)
+            _log_print_pdf_state("immediately before QPdfDocument.load", absolute_path)
+            load_error = document.load(str(absolute_path))
             if load_error != QPdfDocument.Error.None_ or document.status() != QPdfDocument.Status.Ready:
                 raise RuntimeError(f"No se pudo cargar el PDF para imprimir (error {load_error}).")
-            page_rect = self.printer.pageRect(QPrinter.Unit.DevicePixel)
+            logger.debug(
+                "QPdfDocument loaded print PDF: path=%s page_count=%d thread_id=%s",
+                absolute_path,
+                document.pageCount(),
+                get_ident(),
+            )
+            page_rect = printer.pageRect(QPrinter.Unit.DevicePixel)
             page_size = page_rect.size().toSize()
             if document.pageCount() < 1 or page_size.isEmpty():
                 raise RuntimeError("El PDF no contiene páginas imprimibles.")
-            if not painter.begin(self.printer):
+            if not painter.begin(printer):
                 raise RuntimeError("No se pudo iniciar el trabajo de impresión.")
             painter_started = True
-            for page_number in range(document.pageCount()):
-                if page_number and not self.printer.newPage():
+            page_numbers = _selected_pdf_pages(self.settings, document.pageCount())
+            for output_index, page_number in enumerate(page_numbers):
+                if output_index and not printer.newPage():
                     raise RuntimeError("La impresora no pudo preparar la página siguiente.")
                 image = document.render(page_number, page_size)
                 if image.isNull():
@@ -97,17 +231,56 @@ class PrintSendWorker(QObject):
                 painter_started = False
                 raise RuntimeError("No se pudo finalizar el trabajo de impresión.")
             painter_started = False
-            if self.printer.printerState() in (QPrinter.PrinterState.Error, QPrinter.PrinterState.Aborted):
+            if printer.printerState() in (QPrinter.PrinterState.Error, QPrinter.PrinterState.Aborted):
                 raise RuntimeError("El sistema no aceptó el trabajo de impresión.")
+            accepted = True
         except Exception as exc:
             if painter_started:
-                self.printer.abort()
-                painter.end()
-            self.finished.emit(False, str(exc))
-        else:
-            self.finished.emit(True, None)
+                try:
+                    printer.abort()
+                except Exception:
+                    pass
+                try:
+                    painter.end()
+                except Exception:
+                    pass
+            error = str(exc)
         finally:
-            document.close()
+            if document is not None:
+                try:
+                    document.close()
+                except Exception as exc:
+                    if error is None:
+                        error = str(exc)
+                    accepted = False
+            del painter
+            del printer
+            del document
+            logger.debug(
+                "Print send worker completed: path=%s accepted=%s thread_id=%s",
+                self.path.resolve(strict=False),
+                accepted,
+                get_ident(),
+            )
+        self.finished.emit(accepted, error)
+
+
+def _selected_pdf_pages(settings: PrinterSettings, page_count: int) -> list[int]:
+    if settings.print_range == QPrinter.PrintRange.PageRange:
+        if not settings.page_ranges.isEmpty():
+            pages = [
+                page_number - 1
+                for page_number in range(
+                    settings.page_ranges.firstPage(), settings.page_ranges.lastPage() + 1
+                )
+                if settings.page_ranges.contains(page_number)
+            ]
+            return [page for page in pages if 0 <= page < page_count]
+        if settings.from_page > 0 or settings.to_page > 0:
+            first = max(1, settings.from_page or 1)
+            last = min(page_count, settings.to_page or page_count)
+            return list(range(first - 1, last)) if first <= last else []
+    return list(range(page_count))
 
 
 class MainWindow(QMainWindow):
@@ -656,8 +829,11 @@ class MainWindow(QMainWindow):
         self._printing = True
         self._print_result_received = False
         self._print_thread_finished = False
-        self._print_send_done = True
-        self._print_send_thread_finished = True
+        # Treat sending as pending while the native dialog is open. Its nested
+        # event loop can deliver the export thread's finished signal before the
+        # user accepts or cancels the dialog.
+        self._print_send_done = False
+        self._print_send_thread_finished = False
         self._update_action_buttons()
         self._print_thread = QThread(self)
         self._print_worker = PrintPdfWorker(self.session, kind)
@@ -675,38 +851,50 @@ class MainWindow(QMainWindow):
         self._print_result_received = True
         self._print_temp_dir = temporary_directory
         if error:
+            self._print_send_done = True
+            self._print_send_thread_finished = True
             QMessageBox.critical(self, "Error al generar el PDF", error)
         elif self._closing:
-            pass
+            self._print_send_done = True
+            self._print_send_thread_finished = True
         else:
             try:
-                self._show_print_dialog_and_send(Path(path))
+                send_started = self._show_print_dialog_and_send(Path(path))
+                if not send_started:
+                    self._print_send_done = True
+                    self._print_send_thread_finished = True
             except Exception as exc:
+                self._print_send_done = True
+                self._print_send_thread_finished = True
                 QMessageBox.critical(self, "Error de impresión", str(exc))
         self._finish_print_flow_if_ready()
 
-    def _show_print_dialog_and_send(self, path: Path) -> None:
+    def _show_print_dialog_and_send(self, path: Path) -> bool:
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
         dialog = QPrintDialog(printer, self)
-        if dialog.exec() != QPrintDialog.DialogCode.Accepted:
-            return
+        try:
+            result = dialog.exec()
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+        if result != QPrintDialog.DialogCode.Accepted:
+            return False
         if not printer.isValid():
             QMessageBox.critical(self, "Error de impresión", "La impresora seleccionada no es válida.")
-            return
-        self._print_send_done = False
-        self._print_send_thread_finished = False
+            return False
+        settings = PrinterSettings.from_printer(printer)
+        del printer
         self._print_send_thread = QThread(self)
-        self._print_send_worker = PrintSendWorker(path, printer)
+        self._print_send_worker = PrintSendWorker(path, settings)
         self._print_send_worker.moveToThread(self._print_send_thread)
-        printer.moveToThread(self._print_send_thread)
         self._print_send_thread.started.connect(self._print_send_worker.run)
         self._print_send_worker.finished.connect(self._on_print_sent)
         self._print_send_worker.finished.connect(self._print_send_thread.quit)
         self._print_send_worker.finished.connect(self._print_send_worker.deleteLater)
-        self._print_send_worker.finished.connect(printer.deleteLater)
         self._print_send_thread.finished.connect(self._on_print_send_thread_finished)
         self._print_send_thread.finished.connect(self._print_send_thread.deleteLater)
         self._print_send_thread.start()
+        return True
 
     def _on_print_sent(self, accepted: bool, error: str | None) -> None:
         self._print_send_done = True
@@ -733,7 +921,7 @@ class MainWindow(QMainWindow):
         self._print_send_thread = None
         self._print_send_worker = None
         if self._print_temp_dir is not None:
-            self._print_temp_dir.cleanup()
+            _cleanup_print_temp_directory(self._print_temp_dir)
             self._print_temp_dir = None
         self._printing = False
         if not self._closing:
