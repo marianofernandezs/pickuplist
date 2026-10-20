@@ -57,6 +57,11 @@ def test_close_without_worker_uses_owned_thread_attribute(qtbot) -> None:
 def test_export_buttons_keep_their_targets_without_init_lambdas(qtbot, monkeypatch) -> None:
     window = MainWindow()
     qtbot.addWidget(window)
+    window.session.products.extend([
+        SessionProduct("CAJA", "caja", 1, "caja"),
+        SessionProduct("PACK", "pack", 1, "pack"),
+    ])
+    window.refresh_all()
     calls = []
     monkeypatch.setattr(window, "export_pdf", lambda kind, name: calls.append((kind, name)))
 
@@ -67,6 +72,7 @@ def test_export_buttons_keep_their_targets_without_init_lambdas(qtbot, monkeypat
         ("bodega", "Lista Pickeo Bodega.pdf"),
         ("local", "Lista Pickeo Local.pdf"),
     ]
+    assert [button.text() for button in window.print_buttons] == ["Imprimir Bodega", "Imprimir Local"]
 
 
 def test_product_empty_state_distinguishes_initial_search_and_filter(qtbot) -> None:
@@ -110,6 +116,11 @@ def test_no_products_state_guides_to_failed_source_details(qtbot) -> None:
 def test_progress_label_reports_current_document_completion_and_cancellation(qtbot) -> None:
     window = MainWindow()
     qtbot.addWidget(window)
+    window.session.products.extend([
+        SessionProduct("CAJA", "caja", 1, "caja"),
+        SessionProduct("PACK", "pack", 1, "pack"),
+    ])
+    window.refresh_all()
     window._set_processing(True)
     window.progress.show()
 
@@ -118,6 +129,7 @@ def test_progress_label_reports_current_document_completion_and_cancellation(qtb
     assert window.progress_label.text() == "Procesando documento 3 de 5"
     assert not window.reset_button.isEnabled()
     assert all(not button.isEnabled() for button in window.export_buttons)
+    assert all(not button.isEnabled() for button in window.print_buttons)
 
     window.on_progress(5, 5)
     assert window.progress_label.text() == "Finalizando procesamiento…"
@@ -125,10 +137,11 @@ def test_progress_label_reports_current_document_completion_and_cancellation(qtb
     window.on_processed(None, None)
     assert not window.progress.isVisible()
     assert window.progress_label.text() == "Procesamiento cancelado · no se añadieron resultados"
-    assert window.session.products == []
+    assert [product.description_exact for product in window.session.products] == ["CAJA", "PACK"]
     window._set_processing(False)
     assert window.reset_button.isEnabled()
     assert all(button.isEnabled() for button in window.export_buttons)
+    assert all(button.isEnabled() for button in window.print_buttons)
     window.close()
 
 
@@ -249,10 +262,12 @@ def test_source_table_uses_compact_columns_localized_ocr_and_tooltips(qtbot) -> 
     assert window.export_buttons[0].text() == "Lista Pickeo Bodega"
     assert window.export_buttons[1].text() == "Lista Pickeo Local"
     assert all(button.isEnabled() for button in window.export_buttons)
+    assert all(not button.isEnabled() for button in window.print_buttons)
     assert any(label.text() == "Productos CAJA y resumen de facturas." for label in window.exports_panel.findChildren(QLabel))
     assert any(label.text() == "Productos PACK y UNITARIO." for label in window.exports_panel.findChildren(QLabel))
     window._set_processing(True)
     assert all(not button.isEnabled() for button in window.export_buttons)
+    assert all(not button.isEnabled() for button in window.print_buttons)
     window._set_processing(False)
     window.close()
 
@@ -388,6 +403,8 @@ def test_single_pdf_is_committed_once_and_controls_are_restored(qtbot, monkeypat
     assert window.add_button.isEnabled()
     assert window.reset_button.isEnabled()
     assert all(button.isEnabled() for button in window.export_buttons)
+    assert window.print_buttons[0].isEnabled()
+    assert not window.print_buttons[1].isEnabled()
     assert len(window.session.sources) == 1
     assert len(window.session.products) == 1
     assert len(window.session.summaries) == 1
@@ -447,6 +464,8 @@ def test_reset_and_export_are_blocked_until_batch_finishes(qtbot, monkeypatch) -
     assert window.add_button.isEnabled()
     assert window.reset_button.isEnabled()
     assert all(button.isEnabled() for button in window.export_buttons)
+    assert window.print_buttons[0].isEnabled()
+    assert not window.print_buttons[1].isEnabled()
     window.close()
 
 
@@ -470,6 +489,7 @@ def test_extraction_error_is_recorded_without_partial_products(qtbot, monkeypatc
     assert window.add_button.isEnabled()
     assert window.reset_button.isEnabled()
     assert all(button.isEnabled() for button in window.export_buttons)
+    assert not any(button.isEnabled() for button in window.print_buttons)
     window.close()
 
 
@@ -488,6 +508,8 @@ def test_batch_error_does_not_publish_partial_results_and_restores_controls(qtbo
     assert window.add_button.isEnabled()
     assert window.reset_button.isEnabled()
     assert all(button.isEnabled() for button in window.export_buttons)
+    assert window.print_buttons[0].isEnabled()
+    assert not window.print_buttons[1].isEnabled()
     window.close()
 
 

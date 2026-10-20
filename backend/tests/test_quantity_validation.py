@@ -243,4 +243,6 @@ def test_desktop_shows_document_quantity_error_and_exports_only_successful_docum
     assert "FACTURA RECHAZADA" not in local_text
     assert window.add_button.isEnabled()
     assert all(button.isEnabled() for button in window.export_buttons)
+    assert window.print_buttons[0].isEnabled()
+    assert not window.print_buttons[1].isEnabled()
     window.close()

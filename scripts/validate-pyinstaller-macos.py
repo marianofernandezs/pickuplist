@@ -52,6 +52,20 @@ def validate_bundle(app: Path, expected_arch: str) -> dict[str, str]:
     if info.get("CFBundlePackageType") != "APPL":
         fail("CFBundlePackageType is not APPL")
 
+    resources = contents / "Resources"
+    icon_name = info.get("CFBundleIconFile")
+    if not icon_name:
+        fail("CFBundleIconFile is missing")
+    icon_path = resources / icon_name
+    if not icon_path.is_file() and not icon_path.suffix:
+        icon_path = icon_path.with_suffix(".icns")
+    if not icon_path.is_file():
+        fail(f"application icon is missing from Contents/Resources: {icon_name}")
+
+    logo_files = [path for path in app.rglob("pick_list.png") if path.is_file()]
+    if not logo_files:
+        fail("bundled window icon (assets/icons/pick_list.png) is missing")
+
     architectures = command_output("lipo", "-archs", str(executable)).split()
     if set(architectures) != {expected_arch}:
         fail(f"expected only {expected_arch}, found {architectures}")
@@ -70,6 +84,14 @@ def validate_bundle(app: Path, expected_arch: str) -> dict[str, str]:
     ]
     if not qt_cocoa_plugin:
         fail("Qt Cocoa platform plugin (libqcocoa.dylib) is missing")
+    qt_print_modules = {}
+    for module_name in ("QtPdf", "QtPrintSupport"):
+        module_files = [
+            path for path in app.rglob(f"{module_name}*.so") if path.is_file()
+        ]
+        if not module_files:
+            fail(f"PySide6 {module_name} module is missing")
+        qt_print_modules[module_name] = module_files[0]
     mupdf_libraries = [
         path for path in app.rglob("libmupdf*") if path.is_file()
     ]
@@ -84,6 +106,10 @@ def validate_bundle(app: Path, expected_arch: str) -> dict[str, str]:
     print(f"Validated app: {app}")
     print(f"Architecture: {expected_arch}")
     print(f"Bundle identifier: {BUNDLE_IDENTIFIER}")
+    print(f"Application icon: {icon_path.relative_to(app)}")
+    print(f"Window icon: {logo_files[0].relative_to(app)}")
+    for module_name, module_path in qt_print_modules.items():
+        print(f"Qt print module: {module_name} ({module_path.relative_to(app)})")
     print(f"Qt Cocoa plugin: {qt_cocoa_plugin[0].relative_to(app)}")
     print(f"PyMuPDF native library: {mupdf_libraries[0].relative_to(app)}")
     print("Code signature: valid ad hoc signature")

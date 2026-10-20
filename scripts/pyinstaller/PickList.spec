@@ -3,6 +3,7 @@
 
 import os
 import platform
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all
@@ -20,8 +21,13 @@ if platform.machine() != EXPECTED_HOST_ARCH[TARGET_ARCH]:
 
 REPOSITORY_ROOT = Path(SPECPATH).resolve().parents[1]
 BACKEND_ROOT = REPOSITORY_ROOT / "backend"
+ICON_ROOT = BACKEND_ROOT / "app" / "desktop" / "assets" / "icons"
+PNG_ICON = ICON_ROOT / "pick_list.png"
+MACOS_ICON = ICON_ROOT / "PickList.icns"
+WINDOWS_ICON = ICON_ROOT / "PickList.ico"
+EXECUTABLE_ICON = WINDOWS_ICON if sys.platform == "win32" else MACOS_ICON
 
-datas = []
+datas = [(str(PNG_ICON), "assets/icons")]
 binaries = []
 hiddenimports = []
 for package in ("pymupdf", "fitz", "pdfplumber", "pdfminer", "reportlab"):
@@ -29,6 +35,7 @@ for package in ("pymupdf", "fitz", "pdfplumber", "pdfminer", "reportlab"):
     datas += package_datas
     binaries += package_binaries
     hiddenimports += package_hiddenimports
+hiddenimports += ["PySide6.QtPdf", "PySide6.QtPrintSupport"]
 
 a = Analysis(
     [str(BACKEND_ROOT / "app" / "desktop" / "main.py")],
@@ -61,6 +68,7 @@ exe = EXE(
     target_arch=TARGET_ARCH,
     codesign_identity=None,
     entitlements_file=None,
+    icon=str(EXECUTABLE_ICON),
 )
 coll = COLLECT(
     exe,
@@ -74,7 +82,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="Pick List.app",
-    icon=None,
+    icon=str(MACOS_ICON),
     bundle_identifier="com.picklist.desktop",
     info_plist={"CFBundleName": "Pick List", "CFBundleDisplayName": "Pick List"},
 )
