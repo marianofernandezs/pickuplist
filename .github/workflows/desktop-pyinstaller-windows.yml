@@ -1,0 +1,97 @@
+name: Pick List Desktop Windows PyInstaller build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    name: Windows x64
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PICK_LIST_RUN_ROOT: ${{ runner.temp }}\pick-list-pyinstaller\${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.5"
+          enable-cache: false
+
+      - name: Install managed Python 3.12.13 x64
+        run: |
+          uv python install 3.12.13 --architecture x64
+          $pythonPath = (uv python find --managed-python 3.12.13).Trim()
+          if (-not (Test-Path $pythonPath)) {
+            throw "uv did not return an installed Python executable: $pythonPath"
+          }
+          "PICK_LIST_BASE_PYTHON=$pythonPath" >> $env:GITHUB_ENV
+          & $pythonPath -c 'import platform, struct; print(platform.python_version(), platform.machine(), struct.calcsize("P") * 8); assert platform.python_version() == "3.12.13" and struct.calcsize("P") == 8'
+
+      - name: Verify lockfile
+        run: uv lock --project backend --check
+
+      - name: Synchronize locked application and test dependencies
+        run: >-
+          uv sync --project backend --locked --no-default-groups
+          --group test
+          --no-install-project --python "$env:PICK_LIST_BASE_PYTHON"
+
+      - name: Install pinned desktop runtime and Windows PyInstaller toolchain
+        run: |
+          $projectPython = Join-Path $env:GITHUB_WORKSPACE "backend\.venv\Scripts\python.exe"
+          if (-not (Test-Path $projectPython)) {
+            throw "uv did not create the expected project Python: $projectPython"
+          }
+          "PICK_LIST_APP_PYTHON=$projectPython" >> $env:GITHUB_ENV
+          uv pip install --python $projectPython "PySide6==6.12.0"
+          uv pip install --python $projectPython --no-deps --requirements scripts/pyinstaller/requirements-windows.txt
+          & $projectPython -c 'import platform, struct, PyInstaller, PySide6, fitz; print(platform.python_version(), platform.machine(), struct.calcsize("P") * 8); print("PyInstaller", PyInstaller.__version__, "PySide6", PySide6.__version__, "PyMuPDF", fitz.VersionBind); assert platform.python_version() == "3.12.13" and struct.calcsize("P") == 8 and PyInstaller.__version__ == "6.22.3" and PySide6.__version__ == "6.12.0" and fitz.VersionBind == "1.28.2"'
+
+      - name: Run test suite
+        working-directory: backend
+        run: >-
+          uv run --project "$env:GITHUB_WORKSPACE\backend" --locked --no-sync
+          --python "$env:PICK_LIST_BASE_PYTHON" python -m pytest -q
+
+      - name: Create isolated build directories
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:PICK_LIST_RUN_ROOT\dist", "$env:PICK_LIST_RUN_ROOT\work" | Out-Null
+
+      - name: Build onedir Windows application
+        run: |
+          & $env:PICK_LIST_APP_PYTHON -m PyInstaller --noconfirm --clean `
+            --distpath "$env:PICK_LIST_RUN_ROOT\dist" `
+            --workpath "$env:PICK_LIST_RUN_ROOT\work" `
+            scripts/pyinstaller/PickList-windows.spec
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Validate package resources and startup
+        run: |
+          & $env:PICK_LIST_APP_PYTHON scripts/validate-pyinstaller-windows.py `
+            --dist-dir "$env:PICK_LIST_RUN_ROOT\dist" `
+            --icon backend/app/desktop/assets/icons/PickList.ico
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Zip complete onedir package
+        run: |
+          $zipPath = Join-Path $env:PICK_LIST_RUN_ROOT "Pick-List-Windows-x64.zip"
+          & $env:PICK_LIST_APP_PYTHON scripts/package-pyinstaller-windows.py `
+            "$env:PICK_LIST_RUN_ROOT\dist\PickList" $zipPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Publish workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pick-List-Windows-x64
+          path: ${{ runner.temp }}/pick-list-pyinstaller/${{ github.run_id }}-${{ github.run_attempt }}/Pick-List-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14

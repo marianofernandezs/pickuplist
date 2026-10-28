@@ -46,6 +46,34 @@ uv pip install --python backend/.venv/bin/python --no-deps --requirements script
 
 El script rechaza compilaciones cruzadas, comprueba Python 3.12.13, PyInstaller 6.22.3, PySide6 6.12.0 y PyMuPDF 1.28.2, y escribe cada ejecución en un directorio único bajo `dist/macos/pyinstaller/<arquitectura>/`. Genera un bundle `Pick List.app` onedir/windowed y un ZIP mediante `ditto -c -k --keepParent`; no reemplaza los resultados de ejecuciones anteriores. El verificador comprueba arquitectura Mach-O, estructura e identificador del bundle, enlaces simbólicos, plugin Cocoa de Qt, bibliotecas MuPDF, firma ad hoc y preservación de permisos/enlaces en el ZIP.
 
+## Compilar y ejecutar en Windows x64
+
+El paquete Windows usa un spec independiente, `scripts/pyinstaller/PickList-windows.spec`, para mantener separada la configuración macOS. La compilación requiere Windows x64, uv 0.12.5, CPython x64 3.12.13, PySide6 6.12.0, PyMuPDF 1.28.2 y PyInstaller 6.22.3. El spec genera una carpeta onedir sin consola, usa `PickList.ico` para el ejecutable e incluye `pick_list.png` como recurso de ventana. PyInstaller recopila los módulos Qt y su plugin Windows; `scripts/validate-pyinstaller-windows.py` comprueba el PE x64, los módulos `QtPdf` y `QtPrintSupport`, `qwindows.dll`, el PNG y el arranque controlado del paquete.
+
+Para ejecutar el build en GitHub Actions, abrir **Actions → Pick List Desktop Windows PyInstaller build → Run workflow** en la rama deseada. También se puede iniciar con GitHub CLI:
+
+```sh
+gh workflow run desktop-pyinstaller-windows.yml --ref <rama>
+```
+
+Al terminar el workflow, descargar el artefacto **Pick-List-Windows-x64** desde la ejecución de Actions. Descomprimir el ZIP completo y ejecutar `PickList/PickList.exe`; conservar la carpeta `PickList` entera junto al ejecutable. El paquete es autónomo y el programa funciona sin conexión; se necesita Internet solo para instalar dependencias o descargar el artefacto. Se distribuye como aplicación portable, sin privilegios de administrador ni instalador.
+
+El workflow se ejecuta manualmente en `windows-2022`, sincroniza las dependencias base de aplicación y pruebas desde `backend/uv.lock`, instala PySide6 6.12.0 y el toolchain PyInstaller Windows fijado en `scripts/pyinstaller/requirements-windows.txt`, ejecuta pytest y construye en un directorio único de la ejecución. No instala ni ejecuta Nuitka. El validador inicia el ejecutable con `--smoke-test` y un timeout, sin abrir la ventana ni enviar trabajos a impresoras. El ZIP se publica como artefacto por 14 días; no se crean releases automáticamente.
+
+Requisitos de uso: Windows 10 u 11 x64 y una impresora instalada para imprimir. No hace falta instalar Python. Una prueba en una máquina Windows limpia debe confirmar que el paquete no requiere un runtime adicional de Visual C++; esto puede depender de las DLL incluidas por las ruedas nativas. No se configuran firma digital, MSI ni instalador en esta fase.
+
+Antes de distribuir, ejecutar estas comprobaciones manuales en Windows real:
+
+1. Descargar y extraer el ZIP completo; iniciar la app desconectado de la red y confirmar icono de ventana/barra de tareas.
+2. Abrir y exportar PDFs desde carpetas con espacios, caracteres acentuados y rutas largas.
+3. Procesar facturas de referencia y comparar clasificación CAJA/PACK/UNITARIO, resumen, consolidación y contenido de exportaciones Bodega y Local con macOS.
+4. En el diálogo nativo, confirmar impresoras instaladas, cancelar sin trabajo, imprimir todas las páginas y elegir rangos; comprobar copias, orientación, tamaño, color y dúplex cuando el driver los ofrezca.
+5. Para evitar papel físico, seleccionar Microsoft Print to PDF y revisar el PDF resultante. Repetir con una impresora Windows real solo durante aceptación local, nunca en CI.
+6. Cerrar durante procesamiento e impresión; comprobar que no haya bloqueo ni cierre inesperado y que los temporales se eliminen.
+7. Revisar la interfaz con escalado de pantalla 125 %, 150 % y 200 %, y con temas claro y oscuro.
+
+GitHub Actions ejecuta pruebas simuladas de impresión y no requiere impresoras. No confirma que el driver real muestre o respete cada opción; la verificación de diálogo, spooler, escala y runtime de Visual C++ queda pendiente de un equipo Windows.
+
 GitHub Actions define jobs independientes en `macos-15` (arm64) y `macos-15-intel` (x86_64). Cada runner crea un entorno limpio, ejecuta la suite offscreen y publica `Pick-List-macOS-arm64.zip` o `Pick-List-macOS-x86_64.zip`. El workflow se inicia manualmente y no compila con Nuitka. Un artefacto Intel de CI acredita el build, pero no sustituye una prueba de ejecución en un Mac Intel real.
 
 La configuración funcional de PyInstaller se basó en el bundle probado `dist/diagnostics/pyinstaller-desktop/attempt-03/`; el `.spec` versionado evita las rutas absolutas locales e incorpora un identificador estable `com.picklist.desktop`.

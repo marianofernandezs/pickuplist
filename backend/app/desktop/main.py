@@ -7,11 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, get_ident
 
+import fitz
 from PySide6.QtCore import QObject, QThread, Signal, Qt
 from PySide6.QtGui import (QAction, QFont, QKeySequence, QPalette, QShortcut, QIcon,
                            QPainter, QPageLayout, QPageRanges)
 from PySide6.QtPdf import QPdfDocument
-from PySide6.QtPrintSupport import QPrintDialog, QPrinter, QPrinterInfo
+from PySide6.QtPrintSupport import QAbstractPrintDialog, QPrintDialog, QPrinter, QPrinterInfo
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QFrame,
                                QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
                                QMessageBox, QPushButton, QComboBox, QTableWidget,
@@ -86,7 +87,7 @@ class ProcessWorker(QObject):
 
 
 class PrintPdfWorker(QObject):
-    finished = Signal(object, object, object)
+    finished = Signal(object, object, object, object)
 
     def __init__(self, session: PickListSession, kind: str):
         super().__init__()
@@ -105,12 +106,16 @@ class PrintPdfWorker(QObject):
             )
             exported_path = self.session.export(path, self.kind)
             path = Path(exported_path).resolve(strict=True)
+            with fitz.open(path) as document:
+                page_count = document.page_count
+            if page_count < 1:
+                raise RuntimeError("El PDF exportado no contiene páginas imprimibles.")
             _log_print_pdf_state("after export completed", path)
-            self.finished.emit(str(path), None, temporary_directory)
+            self.finished.emit(str(path), None, temporary_directory, page_count)
         except Exception as exc:
             if temporary_directory is not None:
                 _cleanup_print_temp_directory(temporary_directory)
-            self.finished.emit(None, str(exc), None)
+            self.finished.emit(None, str(exc), None, None)
 
 
 @dataclass(frozen=True)
@@ -847,7 +852,8 @@ class MainWindow(QMainWindow):
         self._print_thread.start()
 
     def _on_print_pdf_ready(self, path: str | None, error: str | None,
-                            temporary_directory: tempfile.TemporaryDirectory | None) -> None:
+                            temporary_directory: tempfile.TemporaryDirectory | None,
+                            page_count: int | None) -> None:
         self._print_result_received = True
         self._print_temp_dir = temporary_directory
         if error:
@@ -859,7 +865,7 @@ class MainWindow(QMainWindow):
             self._print_send_thread_finished = True
         else:
             try:
-                send_started = self._show_print_dialog_and_send(Path(path))
+                send_started = self._show_print_dialog_and_send(Path(path), page_count or 0)
                 if not send_started:
                     self._print_send_done = True
                     self._print_send_thread_finished = True
@@ -869,9 +875,14 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Error de impresión", str(exc))
         self._finish_print_flow_if_ready()
 
-    def _show_print_dialog_and_send(self, path: Path) -> bool:
+    def _show_print_dialog_and_send(self, path: Path, page_count: int) -> bool:
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
         dialog = QPrintDialog(printer, self)
+        if sys.platform == "win32" and page_count > 0:
+            # Windows' native print dialog hides page-range controls unless a
+            # valid range is supplied. Keep All Pages as the initial choice.
+            dialog.setMinMax(1, page_count)
+            dialog.setPrintRange(QAbstractPrintDialog.PrintRange.AllPages)
         try:
             result = dialog.exec()
         finally:
@@ -954,10 +965,26 @@ class MainWindow(QMainWindow):
 
 
 def main():
-    app = QApplication(sys.argv)
+    smoke_test = "--smoke-test" in sys.argv[1:]
+    app_args = [sys.argv[0]] if smoke_test else sys.argv
+    app = QApplication(app_args)
     app.setApplicationName("Pick List")
     app.setWindowIcon(QIcon(str(resource_path("assets/icons/pick_list.png"))))
+    if smoke_test:
+        import pdfminer
+        import pdfplumber
+        import pymupdf
+        import reportlab
+        from PySide6 import QtCore, QtGui, QtPdf, QtPrintSupport, QtWidgets
+
+        _ = (pdfminer, pdfplumber, pymupdf, reportlab, QtCore, QtGui, QtPdf,
+             QtPrintSupport, QtWidgets)
     window = MainWindow()
+    if smoke_test:
+        # Used by the Windows CI package check to exercise frozen imports and
+        # widget construction without opening a window or starting a print job.
+        window.close()
+        return 0
     window.show()
     return app.exec()
 

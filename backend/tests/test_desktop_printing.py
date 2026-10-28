@@ -11,7 +11,7 @@ from PIL import Image
 from PySide6.QtCore import QEventLoop, QRectF, QThread
 from PySide6.QtGui import QImage, QPageLayout, QPageRanges
 from PySide6.QtPdf import QPdfDocument
-from PySide6.QtPrintSupport import QPrintDialog
+from PySide6.QtPrintSupport import QAbstractPrintDialog, QPrintDialog
 from PySide6.QtWidgets import QApplication
 
 from app.desktop.application import LocalSource, PickListSession, SessionProduct
@@ -136,7 +136,15 @@ class MockPrintDialog:
 
     def __init__(self, printer, *_args):
         self.printer_id = id(printer)
+        self.page_limits = None
+        self.print_range = None
         self.instances.append(self)
+
+    def setMinMax(self, minimum, maximum):
+        self.page_limits = (minimum, maximum)
+
+    def setPrintRange(self, print_range):
+        self.print_range = print_range
 
     def exec(self):
         return self.result
@@ -168,11 +176,12 @@ def _pdf_text(path: Path) -> str:
 def _generated_pdf(session: PickListSession, kind: str) -> tuple[Path, object]:
     worker = PrintPdfWorker(session, kind)
     result = []
-    worker.finished.connect(lambda path, error, temporary: result.append((path, error, temporary)))
+    worker.finished.connect(lambda *values: result.append(values))
     worker.run()
-    path, error, temporary = result[0]
+    path, error, temporary, page_count = result[0]
     assert error is None
     assert path and Path(path).is_file()
+    assert page_count > 0
     return Path(path), temporary
 
 
@@ -220,6 +229,57 @@ def test_cancelled_print_dialog_does_not_send_or_report_success(qtbot, monkeypat
     assert window._print_send_worker is None
     assert temporary_directories and not Path(temporary_directories[0].name).exists()
     window.close()
+
+
+def test_windows_print_dialog_enables_valid_page_range_and_defaults_to_all(
+    qtbot, monkeypatch, tmp_path
+) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    MockPrintDialog.instances = []
+    monkeypatch.setattr(desktop_main, "sys", type("Platform", (), {"platform": "win32"})())
+    monkeypatch.setattr(desktop_main, "QPrinter", MockPrinter)
+    monkeypatch.setattr(desktop_main, "QPrintDialog", MockPrintDialog)
+    monkeypatch.setattr(MockPrintDialog, "result", QPrintDialog.DialogCode.Rejected)
+    pdf = tmp_path / "lista con espacios – impresión.pdf"
+
+    assert desktop_main.MainWindow._show_print_dialog_and_send(window, pdf, 4) is False
+
+    dialog = MockPrintDialog.instances[-1]
+    assert dialog.page_limits == (1, 4)
+    assert dialog.print_range == QAbstractPrintDialog.PrintRange.AllPages
+    assert window._print_send_worker is None
+    native_test_printer = REAL_QPRINTER()
+    qt_dialog = QPrintDialog(native_test_printer)
+    qt_dialog.setMinMax(1, 4)
+    qt_dialog.setPrintRange(QAbstractPrintDialog.PrintRange.AllPages)
+    assert (qt_dialog.minPage(), qt_dialog.maxPage()) == (1, 4)
+    assert qt_dialog.testOption(QAbstractPrintDialog.PrintDialogOption.PrintPageRange)
+    assert qt_dialog.printer().printRange() == REAL_QPRINTER.PrintRange.AllPages
+    qt_dialog.close()
+    del qt_dialog, native_test_printer
+    window.close()
+
+
+def test_closing_during_print_waits_for_workers_then_closes(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window._printing = True
+
+    window.close()
+
+    assert window.isVisible()
+    assert not window.isEnabled()
+    assert window._closing
+
+    window._print_result_received = True
+    window._print_thread_finished = True
+    window._print_send_done = True
+    window._print_send_thread_finished = True
+    window._finish_print_flow_if_ready()
+
+    assert not window.isVisible()
 
 
 @pytest.mark.parametrize(
@@ -612,6 +672,128 @@ def test_printer_rejection_does_not_report_success(qtbot, monkeypatch, tmp_path)
     assert "no aceptó" in results[0][1]
 
 
+def test_printer_settings_round_trip_preserves_dialog_options() -> None:
+    class SettingsPrinter:
+        def __init__(self, values=None):
+            page_layout = QPageLayout()
+            page_layout.setOrientation(QPageLayout.Orientation.Landscape)
+            self.values = values or {
+                "printer_name": "Windows PDF printer",
+                "page_layout": page_layout,
+                "resolution": 600,
+                "color_mode": REAL_QPRINTER.ColorMode.GrayScale,
+                "duplex": REAL_QPRINTER.DuplexMode.DuplexLongSide,
+                "copy_count": 3,
+                "collate_copies": True,
+                "page_order": REAL_QPRINTER.PageOrder.LastPageFirst,
+                "print_range": REAL_QPRINTER.PrintRange.PageRange,
+                "from_page": 2,
+                "to_page": 4,
+                "page_ranges": QPageRanges.fromString("2-4,7"),
+                "paper_source": REAL_QPRINTER.PaperSource.Auto,
+                "full_page": True,
+                "output_format": REAL_QPRINTER.OutputFormat.NativeFormat,
+                "output_file_name": "",
+                "font_embedding_enabled": False,
+            }
+
+        def __getattr__(self, name):
+            setter = name.startswith("set")
+            attribute = name[3:] if setter else name
+            key = re.sub(r"(?<!^)(?=[A-Z])", "_", attribute).lower()
+            if setter:
+                if attribute == "FromTo":
+                    return lambda first, last: self.values.update(
+                        from_page=first, to_page=last
+                    )
+                return lambda *values: self.values.__setitem__(key, values[0] if len(values) == 1 else values)
+            if key in self.values:
+                return lambda: self.values[key]
+            raise AttributeError(name)
+
+    source = SettingsPrinter()
+    target = SettingsPrinter({key: None for key in source.values})
+    settings = PrinterSettings.from_printer(source)
+
+    settings.apply_to(target)
+
+    for key, value in source.values.items():
+        assert target.values[key] == value, key
+    assert target.values["page_layout"].orientation() == QPageLayout.Orientation.Landscape
+
+
+def test_page_range_and_copy_count_are_applied_without_replaying_pages(
+    monkeypatch, tmp_path
+) -> None:
+    rendered_pages = []
+    created_printers = []
+
+    class RecordingPrinter(MockPrinter):
+        def __init__(self, *_args):
+            super().__init__()
+            self.copy_count = None
+            created_printers.append(self)
+
+        def setCopyCount(self, count):
+            self.copy_count = count
+
+    class Document:
+        Error = QPdfDocument.Error
+        Status = QPdfDocument.Status
+
+        def load(self, *_args):
+            return QPdfDocument.Error.None_
+
+        def status(self):
+            return QPdfDocument.Status.Ready
+
+        def pageCount(self):
+            return 4
+
+        def render(self, page_number, *_args):
+            rendered_pages.append(page_number)
+            return QImage(8, 8, QImage.Format.Format_RGB32)
+
+        def close(self):
+            pass
+
+    class Painter:
+        def begin(self, *_args):
+            return True
+
+        def drawImage(self, *_args):
+            pass
+
+        def end(self):
+            return True
+
+    pdf = tmp_path / "invoice with spaces – factura.pdf"
+    _session().export(pdf, "local")
+    base = _printer_settings()
+    settings = PrinterSettings(
+        **{
+            **base.__dict__,
+            "copy_count": 3,
+            "print_range": REAL_QPRINTER.PrintRange.PageRange,
+            "from_page": 2,
+            "to_page": 3,
+            "page_ranges": QPageRanges.fromString("2-3"),
+        }
+    )
+    monkeypatch.setattr(desktop_main, "QPrinter", RecordingPrinter)
+    monkeypatch.setattr(desktop_main, "QPdfDocument", Document)
+    monkeypatch.setattr(desktop_main, "QPainter", Painter)
+    result = []
+    worker = PrintSendWorker(pdf, settings)
+    worker.finished.connect(lambda *values: result.append(values))
+
+    worker.run()
+
+    assert result == [(True, None)]
+    assert rendered_pages == [1, 2]
+    assert created_printers[0].copy_count == 3
+
+
 def test_absence_of_printers_shows_error_without_starting_worker(qtbot, monkeypatch) -> None:
     window = MainWindow()
     qtbot.addWidget(window)
@@ -649,6 +831,7 @@ def test_pdf_generation_failure_reports_error_and_removes_temporary_directory(mo
     assert result[0][0] is None
     assert result[0][1] == "export failed"
     assert result[0][2] is None
+    assert result[0][3] is None
     assert created and not Path(created[0].name).exists()
 
 
