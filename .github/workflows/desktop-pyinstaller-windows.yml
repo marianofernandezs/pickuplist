@@ -15,10 +15,16 @@ jobs:
         shell: pwsh
     env:
       QT_QPA_PLATFORM: offscreen
-      PICK_LIST_RUN_ROOT: ${{ runner.temp }}\pick-list-pyinstaller\${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Initialize isolated run directories
+        run: |
+          $runId = "$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)"
+          $runRoot = Join-Path $env:RUNNER_TEMP "pick-list-pyinstaller\$runId"
+          "PICK_LIST_RUN_ROOT=$runRoot" >> $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force -Path "$runRoot\dist", "$runRoot\work" | Out-Null
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -61,10 +67,6 @@ jobs:
         run: >-
           uv run --project "$env:GITHUB_WORKSPACE\backend" --locked --no-sync
           --python "$env:PICK_LIST_BASE_PYTHON" python -m pytest -q
-
-      - name: Create isolated build directories
-        run: |
-          New-Item -ItemType Directory -Force -Path "$env:PICK_LIST_RUN_ROOT\dist", "$env:PICK_LIST_RUN_ROOT\work" | Out-Null
 
       - name: Build onedir Windows application
         run: |
