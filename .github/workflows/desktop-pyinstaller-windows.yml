@@ -34,13 +34,22 @@ jobs:
 
       - name: Install managed Python 3.12.13 x64
         run: |
-          uv python install 3.12.13 --architecture x64
+          uv python install 3.12.13
+          if ($LASTEXITCODE -ne 0) {
+            throw "uv failed to install Python 3.12.13 (exit code $LASTEXITCODE)"
+          }
           $pythonPath = (uv python find --managed-python 3.12.13).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "uv failed to locate managed Python 3.12.13 (exit code $LASTEXITCODE)"
+          }
           if (-not (Test-Path $pythonPath)) {
             throw "uv did not return an installed Python executable: $pythonPath"
           }
           "PICK_LIST_BASE_PYTHON=$pythonPath" >> $env:GITHUB_ENV
           & $pythonPath -c 'import platform, struct; print(platform.python_version(), platform.machine(), struct.calcsize("P") * 8); assert platform.python_version() == "3.12.13" and struct.calcsize("P") == 8'
+          if ($LASTEXITCODE -ne 0) {
+            throw "The managed Python version or architecture check failed (exit code $LASTEXITCODE)"
+          }
 
       - name: Verify lockfile
         run: uv lock --project backend --check
