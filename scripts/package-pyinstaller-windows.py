@@ -27,11 +27,13 @@ def main() -> None:
         with ZipFile(zip_path, mode="x", compression=ZIP_DEFLATED, compresslevel=6) as archive:
             for path in files:
                 archive.write(path, path.relative_to(package_dir.parent))
-            bad_file = archive.testzip()
-            if bad_file is not None:
-                raise SystemExit(f"ZIP integrity check failed at {bad_file}")
     except FileExistsError:
         raise SystemExit(f"Refusing to replace an existing ZIP: {zip_path}") from None
+
+    with ZipFile(zip_path, mode="r") as archive:
+        bad_file = archive.testzip()
+        if bad_file is not None:
+            raise SystemExit(f"ZIP integrity check failed at {bad_file}")
 
     print(f"Created {zip_path} with {len(files)} package files")
 

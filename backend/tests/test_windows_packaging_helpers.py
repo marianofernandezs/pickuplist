@@ -17,17 +17,23 @@ def test_windows_package_zip_keeps_executable_dlls_resources_and_hidden_files(tm
     (package_dir / ".hidden-resource").write_bytes(b"hidden")
     zip_path = tmp_path / "Pick-List-Windows-x64.zip"
 
-    subprocess.run(
+    result = subprocess.run(
         [
             sys.executable,
             str(repository / "scripts" / "package-pyinstaller-windows.py"),
             str(package_dir),
             str(zip_path),
         ],
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
         timeout=10,
+    )
+    assert result.returncode == 0, (
+        "Windows ZIP packager failed. "
+        f"Exit code: {result.returncode}\n"
+        f"stdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
     )
 
     with ZipFile(zip_path) as archive:
