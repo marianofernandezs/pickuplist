@@ -91,14 +91,17 @@ def build_registro_interno_buffers(lines: list[str]) -> list[tuple[int, str]]:
 
 
 def _parsed_registry_product(parsed: dict[str, Any], page_number: int) -> ParsedProduct:
-    presentation = str(parsed["tipo_presentacion"]).upper()
+    # Reuse the quantity-column vocabulary used by invoices at the shared
+    # extraction boundary, without changing the registry parser's output.
+    classification = parse_quantity_cell(f'1 {parsed["tipo_presentacion"]}')
+    presentation = classification.presentation.upper()
     return ParsedProduct(
         sku=str(parsed["sku"]),
         descripcion_exacta=str(parsed["descripcion_exacta"]),
         cantidad=parsed["cantidad"],
         tipo_presentacion=presentation,
         page_number=page_number,
-        unit=presentation.lower(),
+        unit=classification.unit,
     )
 
 
